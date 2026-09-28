@@ -98,7 +98,8 @@ public class Protocol {
      * Encode a replication request
      */
     public static ByteBuffer encodeReplicateRequest(String topic, int partition, long offset, byte[] message) {
-        ByteBuffer buffer = ByteBuffer.allocate(17 + topic.length() + message.length);
+        // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
+        ByteBuffer buffer = ByteBuffer.allocate(19 + topic.length() + message.length);
         buffer.put(REPLICATE);
         buffer.putShort((short) topic.length());
         buffer.put(topic.getBytes());

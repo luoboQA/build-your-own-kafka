@@ -657,7 +657,8 @@ public class SimpleKafkaBroker {
             leaderChannel.connect(new InetSocketAddress(leader.getHost(), leader.getPort()));
 
             // Prepare forwarded produce request
-            ByteBuffer request = ByteBuffer.allocate(9 + topic.length() + message.length);
+            // Header: 1 (type) + 2 (topic length) + 4 (partition) + 4 (message length) = 11
+            ByteBuffer request = ByteBuffer.allocate(11 + topic.length() + message.length);
             request.put(Protocol.PRODUCE);
             request.putShort((short) topic.length());
             request.put(topic.getBytes());
@@ -676,7 +677,7 @@ public class SimpleKafkaBroker {
 
             // Forward leader's response back to client
             clientChannel.write(response);
-        } catch (IOException e) {
+        } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to forward produce request to leader", e);
             Protocol.sendErrorResponse(clientChannel, "Failed to forward to leader");
         }
@@ -691,15 +692,19 @@ public class SimpleKafkaBroker {
                 continue; // Skip self
 
             BrokerInfo follower = clusterMetadata.get(followerId);
-            if (follower == null)
+            if (follower == null) {
+                LOGGER.warning("Cannot replicate partition " + partition.getId() + " of topic " +
+                        topic + ": follower broker " + followerId + " is not known to this broker");
                 continue;
+            }
 
             executor.submit(() -> {
                 try (SocketChannel followerChannel = SocketChannel.open()) {
                     followerChannel.connect(new InetSocketAddress(follower.getHost(), follower.getPort()));
 
                     // Prepare replication request
-                    ByteBuffer request = ByteBuffer.allocate(17 + topic.length() + message.length);
+                    // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
+                    ByteBuffer request = ByteBuffer.allocate(19 + topic.length() + message.length);
                     request.put(Protocol.REPLICATE);
                     request.putShort((short) topic.length());
                     request.put(topic.getBytes());
@@ -720,7 +725,7 @@ public class SimpleKafkaBroker {
                     byte ack = response.get();
                     LOGGER.info("Replication to follower " + followerId + " " +
                             (ack == Protocol.REPLICATE_ACK ? "succeeded" : "failed"));
-                } catch (IOException e) {
+                } catch (Exception e) {
                     LOGGER.log(Level.SEVERE, "Replication to follower " + followerId + " failed", e);
                 }
             });
