@@ -202,16 +202,12 @@ public class SimpleKafkaClient {
             
             // Send produce request
             ByteBuffer request = Protocol.encodeProduceRequest(topic, partition, message);
-            channel.write(request);
+            Protocol.writeFully(channel, request);
             
-            // Read response
-            ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
-            int bytesRead = channel.read(response);
-            if (bytesRead <= 0) {
-                throw new IOException("No data received from broker");
-            }
-            
-            response.flip();
+            // Read response. The leader waits for its followers to store the message
+            // before it replies, so the answer can arrive well after the request - and
+            // it may well arrive in more than one piece.
+            ByteBuffer response = Protocol.readProduceResponse(channel, Protocol.PRODUCE_RESPONSE_TIMEOUT_MS);
             
             Protocol.ProduceResult result = Protocol.decodeProduceResponse(response);
             

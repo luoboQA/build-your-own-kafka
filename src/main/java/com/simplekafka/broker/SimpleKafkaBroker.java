@@ -9,10 +9,14 @@ import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -34,6 +38,14 @@ public class SimpleKafkaBroker {
     private final AtomicBoolean isController;
     private final Map<Integer, BrokerInfo> clusterMetadata;
     private final ZookeeperClient zkClient;
+    /**
+     * One ordered replication queue per (topic, partition, follower). Replicas must
+     * receive offsets in the order the leader assigned them, so each queue runs on a
+     * single thread; separate queues keep a slow follower from blocking the others.
+     */
+    private final Map<String, ExecutorService> replicationExecutors = new ConcurrentHashMap<>();
+    /** How long the leader waits for a follower to answer a replication request. */
+    private static final long REPLICATION_TIMEOUT_MS = 10_000;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -133,7 +145,6 @@ public class SimpleKafkaBroker {
         }
 
         String topicDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
-        new File(topicDir).mkdirs();
 
         List<String> partitionIds = zkClient.getChildren(topicPath + "/partitions");
         List<Partition> partitions = new ArrayList<>();
@@ -156,10 +167,13 @@ public class SimpleKafkaBroker {
                 }
             }
 
+            // Only a broker that actually replicates the partition gets a log
+            // directory. Everyone else keeps the assignment (leader + followers)
+            // so it can answer metadata requests and forward writes, but writing a
+            // log file here would create an empty log starting at offset 0.
             String partitionDir = topicDir + File.separator + id;
-            new File(partitionDir).mkdirs();
-
-            Partition partition = new Partition(id, leader, followers, partitionDir);
+            Partition partition =
+                    new Partition(id, leader, followers, partitionDir, storesPartition(leader, followers));
             partitions.add(partition);
 
             LOGGER.info("Loaded partition " + id + " for topic " + topic +
@@ -168,6 +182,22 @@ public class SimpleKafkaBroker {
 
         topics.put(topic, partitions);
         LOGGER.info("Successfully loaded topic: " + topic + " with " + partitions.size() + " partitions");
+    }
+
+    /**
+     * Whether this broker stores the log of a partition, i.e. whether it is the
+     * leader or one of its followers.
+     */
+    private boolean storesPartition(int leader, List<Integer> followers) {
+        if (leader == brokerId) {
+            return true;
+        }
+        for (int follower : followers) {
+            if (follower == brokerId) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -265,6 +295,12 @@ public class SimpleKafkaBroker {
                 executor.shutdown();
                 executor.awaitTermination(5, TimeUnit.SECONDS);
 
+                // Shut down the replication queues
+                for (ExecutorService replication : replicationExecutors.values()) {
+                    replication.shutdown();
+                }
+                replicationExecutors.clear();
+
                 // Close ZooKeeper connection
                 zkClient.close();
 
@@ -350,71 +386,86 @@ public class SimpleKafkaBroker {
     }
 
     /**
-     * Participate in controller election
+     * Participate in controller election.
+     *
+     * <p>The election is a single atomic ZooKeeper create: every broker but the
+     * winner is told the node already exists, which {@link
+     * ZookeeperClient#createEphemeralNode} reports as {@code false}. That is the
+     * normal outcome for most brokers and must never be logged as an election
+     * failure - only a real ZooKeeper error is.
      */
     private void electController() {
         try {
             String controllerPath = "/controller";
-            
-            // First, make sure the node doesn't already exist (or is empty)
-            boolean nodeExists = zkClient.exists(controllerPath);
-            if (nodeExists) {
-                String existingData = zkClient.getData(controllerPath);
-                if (existingData == null || existingData.trim().isEmpty()) {
-                    // Node exists but has empty data, try to delete it
-                    zkClient.deleteNode(controllerPath);
-                    nodeExists = false;
-                    LOGGER.info("Deleted empty controller node");
-                }
-            }
-            
-            // Now try to create the node
-            boolean becameController = false;
-            if (!nodeExists) {
-                becameController = zkClient.createEphemeralNode(controllerPath, String.valueOf(brokerId));
-            }
-            
-            if (becameController) {
-                isController.set(true);
-                LOGGER.info("This broker is now the active controller");
-                
-                // As controller, ensure all topics are properly replicated
-                rebalancePartitions();
-            } else {
-                // Double-check the data
-                String controllerId = zkClient.getData(controllerPath);
-                if (controllerId == null || controllerId.trim().isEmpty()) {
-                    LOGGER.warning("Controller node exists but has no data. This is unexpected.");
-                    // Try again after a delay
-                    new Thread(() -> {
-                        try {
-                            Thread.sleep(1000);
-                            electController();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }).start();
+
+            // Clear a leftover placeholder from an older version before trying; without
+            // one this is a cheap no-op read.
+            zkClient.deleteEmptyNode(controllerPath);
+
+            // The winner's node can be removed again by a broker that read the
+            // placeholder a moment earlier, so a couple of turns are allowed before
+            // falling back to a delayed retry.
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (claimControllership(controllerPath)) {
+                    isController.set(true);
+                    LOGGER.info("This broker is now the active controller");
+
+                    // As controller, ensure all topics are properly replicated
+                    rebalancePartitions();
                     return;
                 }
-                
+
+                // For every broker but one, losing the race is the expected result.
+                String controllerId = zkClient.readDataIfPresent(controllerPath);
+                if (controllerId == null || controllerId.trim().isEmpty()) {
+                    // The node disappeared (or a placeholder was in the way) between our
+                    // attempt and our read: go around again rather than watching a node
+                    // that is already gone.
+                    zkClient.deleteEmptyNode(controllerPath);
+                    continue;
+                }
+
                 LOGGER.info("Current controller is broker " + controllerId);
-                
-                // Watch controller node for changes
+
+                // Watch the controller node for changes
                 zkClient.watchNode(controllerPath, this::onControllerChange);
+                return;
             }
+
+            scheduleControllerElection(1000);
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Controller election failed", e);
-            
-            // Try again after a delay
-            new Thread(() -> {
-                try {
-                    Thread.sleep(2000);
-                    electController();
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
-            }).start();
+
+            scheduleControllerElection(2000);
         }
+    }
+
+    /**
+     * Try to take controllership and confirm afterwards that the node still holds
+     * this broker's id: a concurrent stale-placeholder cleanup could have removed it
+     * again, and running as a controller nobody can see is worse than retrying.
+     */
+    private boolean claimControllership(String controllerPath) throws Exception {
+        if (!zkClient.createEphemeralNode(controllerPath, String.valueOf(brokerId))) {
+            return false;
+        }
+        return String.valueOf(brokerId).equals(zkClient.readDataIfPresent(controllerPath));
+    }
+
+    /**
+     * Retry the election later without blocking the caller
+     */
+    private void scheduleControllerElection(long delayMillis) {
+        Thread thread = new Thread(() -> {
+            try {
+                Thread.sleep(delayMillis);
+                electController();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "controller-election-" + brokerId);
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /**
@@ -454,6 +505,12 @@ public class SimpleKafkaBroker {
                             followers.add(brokers.get(i));
                         }
                         partition.setFollowers(followers);
+
+                        if (newLeader == brokerId && !partition.isLocalReplica()) {
+                            LOGGER.warning("Partition " + partition.getId() + " of topic " + topic +
+                                    " was reassigned to this broker, but this broker holds no log" +
+                                    " for it; writes to it will be rejected");
+                        }
 
                         // Update partition metadata in ZooKeeper
                         updatePartitionMetadata(topic, partition);
@@ -627,19 +684,72 @@ public class SimpleKafkaBroker {
             return;
         }
 
-        // Append message to log
-        long offset = targetPartition.append(message);
+        // Append the message and hand it to the replication queue as one step, so the
+        // followers see offsets in exactly the order the leader assigned them.
+        long offset;
+        List<CompletableFuture<Void>> acks;
+        synchronized (targetPartition) {
+            offset = targetPartition.append(message);
+            if (offset < 0) {
+                Protocol.sendErrorResponse(clientChannel, "Failed to append message");
+                return;
+            }
 
-        // Replicate to followers
-        replicateToFollowers(topic, targetPartition, message, offset);
+            acks = replicateToFollowers(topic, targetPartition, message, offset);
+        }
+
+        // acks=all: the client is only told the write succeeded once every follower
+        // this broker knows about has durably stored it. The wait happens outside the
+        // monitor so other producers for this partition keep moving, and the
+        // submission order that the wait depends on was already fixed above.
+        //
+        // A refused acknowledgement does not roll the leader's copy back - Kafka
+        // doesn't either - so the client may retry and end up with the message at a
+        // later offset. What must not happen is reporting success for a write that
+        // only exists on one broker.
+        String replicationFailure = awaitReplication(acks);
+        if (replicationFailure != null) {
+            LOGGER.warning("Rejecting produce to " + topic + "/" + partition + "@" + offset +
+                    ": " + replicationFailure);
+            Protocol.sendErrorResponse(clientChannel, replicationFailure);
+            return;
+        }
 
         // Send acknowledgment to client
         ByteBuffer response = ByteBuffer.allocate(10);
         response.put(Protocol.PRODUCE_RESPONSE);
         response.putLong(offset);
-        response.put((byte) (offset > -1 ? 0 : 1)); // 0 = success, 1 = error
+        response.put((byte) 0); // 0 = success, 1 = error
         response.flip();
-        clientChannel.write(response);
+        Protocol.writeFully(clientChannel, response);
+    }
+
+    /**
+     * Block until every follower has stored the message.
+     *
+     * @return {@code null} when the write is replicated, otherwise the reason the
+     *         produce has to be reported as failed
+     */
+    private String awaitReplication(List<CompletableFuture<Void>> acks) {
+        if (acks.isEmpty()) {
+            return null; // no follower this broker knows about, nothing to wait for
+        }
+
+        try {
+            CompletableFuture.allOf(acks.toArray(new CompletableFuture<?>[0]))
+                    .get(REPLICATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            return null;
+        } catch (TimeoutException e) {
+            return "Timed out waiting for the followers to replicate the message";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Interrupted while waiting for the followers to replicate the message";
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            String detail = cause.getMessage();
+            return "A follower did not replicate the message: " +
+                    (detail == null ? cause.getClass().getSimpleName() : detail);
+        }
     }
 
     /**
@@ -654,7 +764,7 @@ public class SimpleKafkaBroker {
         }
 
         try (SocketChannel leaderChannel = SocketChannel.open()) {
-            leaderChannel.connect(new InetSocketAddress(leader.getHost(), leader.getPort()));
+            connect(leaderChannel, leader, REPLICATION_TIMEOUT_MS);
 
             // Prepare forwarded produce request
             // Header: 1 (type) + 2 (topic length) + 4 (partition) + 4 (message length) = 11
@@ -668,15 +778,16 @@ public class SimpleKafkaBroker {
             request.flip();
 
             // Send request to leader
-            leaderChannel.write(request);
+            Protocol.writeFully(leaderChannel, request);
 
-            // Read response from leader
-            ByteBuffer response = ByteBuffer.allocate(10);
-            leaderChannel.read(response);
-            response.flip();
+            // Read the leader's response. The leader now waits for its followers before
+            // answering, so this takes longer than it used to - and a single read()
+            // would hand back whatever fragment of the frame arrived first.
+            ByteBuffer response =
+                    Protocol.readProduceResponse(leaderChannel, Protocol.PRODUCE_RESPONSE_TIMEOUT_MS);
 
             // Forward leader's response back to client
-            clientChannel.write(response);
+            Protocol.writeFully(clientChannel, response);
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to forward produce request to leader", e);
             Protocol.sendErrorResponse(clientChannel, "Failed to forward to leader");
@@ -684,52 +795,208 @@ public class SimpleKafkaBroker {
     }
 
     /**
-     * Replicate message to follower brokers
+     * Queue the message for every follower of this partition and return one future
+     * per follower that has to acknowledge it.
+     *
+     * <p>Replication runs asynchronously on a per (topic, partition, follower) thread
+     * so offsets reach each replica in the order the leader assigned them; the
+     * futures let the caller wait for the outcome without giving up that ordering.
+     * Followers this broker has never heard of are skipped rather than failed: it
+     * cannot replicate to a broker it does not know about, and pretending it could
+     * would make every produce to a partition fail during startup.
      */
-    private void replicateToFollowers(String topic, Partition partition, byte[] message, long offset) {
+    private List<CompletableFuture<Void>> replicateToFollowers(String topic, Partition partition,
+            byte[] message, long offset) {
+        int partitionId = partition.getId();
+        List<CompletableFuture<Void>> acks = new ArrayList<>();
+
         for (int followerId : partition.getFollowers()) {
             if (followerId == brokerId)
                 continue; // Skip self
 
             BrokerInfo follower = clusterMetadata.get(followerId);
             if (follower == null) {
-                LOGGER.warning("Cannot replicate partition " + partition.getId() + " of topic " +
+                LOGGER.warning("Cannot replicate partition " + partitionId + " of topic " +
                         topic + ": follower broker " + followerId + " is not known to this broker");
                 continue;
             }
 
-            executor.submit(() -> {
-                try (SocketChannel followerChannel = SocketChannel.open()) {
-                    followerChannel.connect(new InetSocketAddress(follower.getHost(), follower.getPort()));
-
-                    // Prepare replication request
-                    // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
-                    ByteBuffer request = ByteBuffer.allocate(19 + topic.length() + message.length);
-                    request.put(Protocol.REPLICATE);
-                    request.putShort((short) topic.length());
-                    request.put(topic.getBytes());
-                    request.putInt(partition.getId());
-                    request.putLong(offset);
-                    request.putInt(message.length);
-                    request.put(message);
-                    request.flip();
-
-                    // Send request to follower
-                    followerChannel.write(request);
-
-                    // Read acknowledgment
-                    ByteBuffer response = ByteBuffer.allocate(1);
-                    followerChannel.read(response);
-                    response.flip();
-
-                    byte ack = response.get();
-                    LOGGER.info("Replication to follower " + followerId + " " +
-                            (ack == Protocol.REPLICATE_ACK ? "succeeded" : "failed"));
-                } catch (Exception e) {
-                    LOGGER.log(Level.SEVERE, "Replication to follower " + followerId + " failed", e);
-                }
-            });
+            CompletableFuture<Void> acked = new CompletableFuture<>();
+            acks.add(acked);
+            replicationExecutor(topic, partitionId, followerId).submit(
+                    () -> replicateMessage(topic, partitionId, follower, offset, message, acked));
         }
+
+        return acks;
+    }
+
+    /**
+     * Ordered replication queue for one (topic, partition, follower) triple
+     */
+    private ExecutorService replicationExecutor(String topic, int partitionId, int followerId) {
+        String key = topic + "/" + partitionId + "->" + followerId;
+        return replicationExecutors.computeIfAbsent(key, k -> {
+            ThreadFactory factory = r -> {
+                Thread thread = new Thread(r, "replication-" + k);
+                thread.setDaemon(true);
+                return thread;
+            };
+            return Executors.newSingleThreadExecutor(factory);
+        });
+    }
+
+    /**
+     * Send one message to a follower and, if the follower reports that it is behind,
+     * re-send everything it is missing starting from its own log end offset.
+     *
+     * <p>The outcome is reported through {@code acked}, which the leader waits on
+     * before acknowledging the produce to its client.
+     */
+    private void replicateMessage(String topic, int partitionId, BrokerInfo follower,
+            long offset, byte[] message, CompletableFuture<Void> acked) {
+        try {
+            ReplicationAck ack = sendReplicateRequest(topic, partitionId, follower, offset, message);
+
+            if (ack.status == Protocol.REPLICATE_ACK) {
+                LOGGER.info("Replication of " + topic + "/" + partitionId + "@" + offset +
+                        " to broker " + follower.getId() + " succeeded");
+                acked.complete(null);
+                return;
+            }
+
+            if (ack.status == Protocol.REPLICATE_NACK && ack.logEndOffset >= 0
+                    && ack.logEndOffset <= offset) {
+                LOGGER.warning("Broker " + follower.getId() + " is behind for " + topic + "/" +
+                        partitionId + ": its log ends at " + ack.logEndOffset + " but the leader wrote " +
+                        offset + ". Catching it up.");
+                if (catchUpFollower(topic, partitionId, follower, ack.logEndOffset, offset)) {
+                    acked.complete(null);
+                } else {
+                    acked.completeExceptionally(new IOException("broker " + follower.getId() +
+                            " could not be caught up through offset " + offset));
+                }
+                return;
+            }
+
+            LOGGER.severe("Replication of " + topic + "/" + partitionId + "@" + offset +
+                    " to broker " + follower.getId() + " failed with status " + ack.status);
+            acked.completeExceptionally(new IOException("broker " + follower.getId() +
+                    " answered the replication request with status " + ack.status));
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Replication to broker " + follower.getId() + " failed", e);
+            acked.completeExceptionally(e);
+        }
+    }
+
+    /**
+     * Re-send everything the follower is missing, from its log end offset up to and
+     * including {@code toOffset}.
+     *
+     * @return true when the follower has confirmed every message through
+     *         {@code toOffset}
+     */
+    private boolean catchUpFollower(String topic, int partitionId, BrokerInfo follower,
+            long fromOffset, long toOffset) throws IOException {
+        Partition partition = findPartition(topic, partitionId);
+        if (partition == null) {
+            LOGGER.severe("Cannot catch up broker " + follower.getId() + ": partition " +
+                    partitionId + " of topic " + topic + " is no longer loaded");
+            return false;
+        }
+
+        long cursor = fromOffset;
+        while (cursor <= toOffset) {
+            List<byte[]> batch = partition.readMessages(cursor, 64 * 1024);
+            if (batch.isEmpty()) {
+                LOGGER.severe("Cannot catch up broker " + follower.getId() + ": leader has no data at offset " + cursor);
+                return false;
+            }
+
+            for (byte[] pending : batch) {
+                if (cursor > toOffset) {
+                    break;
+                }
+
+                ReplicationAck ack = sendReplicateRequest(topic, partitionId, follower, cursor, pending);
+                if (ack.status != Protocol.REPLICATE_ACK) {
+                    LOGGER.severe("Catch-up of broker " + follower.getId() + " for " + topic + "/" +
+                            partitionId + " stopped at offset " + cursor + " with status " + ack.status);
+                    return false;
+                }
+                cursor++;
+            }
+        }
+
+        LOGGER.info("Broker " + follower.getId() + " caught up for " + topic + "/" + partitionId +
+                " through offset " + toOffset);
+        return true;
+    }
+
+    /**
+     * Send a single replication request and read the follower's reply
+     */
+    private ReplicationAck sendReplicateRequest(String topic, int partitionId, BrokerInfo follower,
+            long offset, byte[] message) throws IOException {
+        try (SocketChannel followerChannel = SocketChannel.open()) {
+            connect(followerChannel, follower, REPLICATION_TIMEOUT_MS);
+
+            // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
+            ByteBuffer request = ByteBuffer.allocate(19 + topic.length() + message.length);
+            request.put(Protocol.REPLICATE);
+            request.putShort((short) topic.length());
+            request.put(topic.getBytes());
+            request.putInt(partitionId);
+            request.putLong(offset);
+            request.putInt(message.length);
+            request.put(message);
+            request.flip();
+
+            Protocol.writeFully(followerChannel, request);
+
+            ByteBuffer response = ByteBuffer.allocate(Protocol.REPLICATION_RESPONSE_SIZE);
+            Protocol.readFully(followerChannel, response, REPLICATION_TIMEOUT_MS);
+            response.flip();
+
+            return new ReplicationAck(response.get(), response.getLong());
+        }
+    }
+
+    /**
+     * Connect with a deadline. A plain blocking {@code connect()} can hang for
+     * minutes against an unreachable host, which would strand this replication queue
+     * and turn every later produce for the partition into a timeout.
+     */
+    private static void connect(SocketChannel channel, BrokerInfo broker, long timeoutMillis)
+            throws IOException {
+        channel.configureBlocking(false);
+        try {
+            if (!channel.connect(new InetSocketAddress(broker.getHost(), broker.getPort()))) {
+                long deadline = System.currentTimeMillis() + timeoutMillis;
+                while (!channel.finishConnect()) {
+                    if (System.currentTimeMillis() > deadline) {
+                        throw new IOException("Timed out connecting to broker " + broker.getId() +
+                                " at " + broker.getHost() + ":" + broker.getPort());
+                    }
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while connecting to broker " + broker.getId(), e);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new IOException("Cannot reach broker " + broker.getId() + " at " +
+                    broker.getHost() + ":" + broker.getPort() + ": " + e.getMessage(), e);
+        }
+        channel.configureBlocking(true);
+    }
+
+    /**
+     * Reply to a replication request
+     */
+    private void replyReplication(SocketChannel clientChannel, byte status, long logEndOffset) throws IOException {
+        Protocol.writeFully(clientChannel, Protocol.encodeReplicationResponse(status, logEndOffset));
     }
 
     /**
@@ -749,42 +1016,57 @@ public class SimpleKafkaBroker {
 
         LOGGER.info("Replication request for topic: " + topic + ", partition: " + partitionId + ", offset: " + offset);
 
-        // Check if topic exists
-        if (!topics.containsKey(topic)) {
-            ByteBuffer response = ByteBuffer.allocate(1);
-            response.put((byte) 0); // Failed
-            response.flip();
-            clientChannel.write(response);
+        Partition targetPartition = findPartition(topic, partitionId);
+        if (targetPartition == null) {
+            replyReplication(clientChannel, Protocol.REPLICATE_FAILED, 0);
             return;
         }
 
-        // Find the partition
-        List<Partition> partitions = topics.get(topic);
-        Partition targetPartition = null;
+        // The leader owns the offset: write at exactly the position it picked, or say
+        // where this replica's log ends so the leader can re-send what is missing.
+        long result = targetPartition.appendAt(offset, message);
 
-        for (Partition p : partitions) {
-            if (p.getId() == partitionId) {
-                targetPartition = p;
-                break;
+        byte status;
+        if (result == offset) {
+            status = Protocol.REPLICATE_ACK;
+        } else if (result == -1) {
+            status = Protocol.REPLICATE_NACK;
+        } else {
+            status = Protocol.REPLICATE_FAILED;
+        }
+
+        replyReplication(clientChannel, status, targetPartition.getLogEndOffset());
+    }
+
+    /**
+     * Find a partition by topic name and id, or null when this broker does not have it
+     */
+    private Partition findPartition(String topic, int partitionId) {
+        List<Partition> partitions = topics.get(topic);
+        if (partitions == null) {
+            return null;
+        }
+
+        for (Partition partition : partitions) {
+            if (partition.getId() == partitionId) {
+                return partition;
             }
         }
 
-        if (targetPartition == null) {
-            ByteBuffer response = ByteBuffer.allocate(1);
-            response.put((byte) 0); // Failed
-            response.flip();
-            clientChannel.write(response);
-            return;
+        return null;
+    }
+
+    /**
+     * A follower's reply to a replication request
+     */
+    private static class ReplicationAck {
+        private final byte status;
+        private final long logEndOffset;
+
+        ReplicationAck(byte status, long logEndOffset) {
+            this.status = status;
+            this.logEndOffset = logEndOffset;
         }
-
-        // Append message to log (as follower)
-        long appendedOffset = targetPartition.append(message);
-
-        // Send acknowledgment
-        ByteBuffer response = ByteBuffer.allocate(1);
-        response.put(Protocol.REPLICATE_ACK);
-        response.flip();
-        clientChannel.write(response);
     }
 
     /**
@@ -981,7 +1263,13 @@ public class SimpleKafkaBroker {
         // Find controller
         int controllerId = -1;
         try {
-            String controllerData = zkClient.getData("/controller");
+            String controllerData = zkClient.readDataIfPresent("/controller");
+            if (controllerData == null || controllerData.trim().isEmpty()) {
+                // Not an error: nobody has won the election yet.
+                LOGGER.warning("No active controller yet, cannot create topic " + topic);
+                Protocol.sendErrorResponse(clientChannel, "Controller not available");
+                return;
+            }
             controllerId = Integer.parseInt(controllerData);
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to get controller info", e);
@@ -1033,9 +1321,9 @@ public class SimpleKafkaBroker {
         }
 
         try {
-            // Create topic directory
+            // Topic/partition directories are created lazily by Partition itself,
+            // and only for the partitions this broker actually replicates.
             String topicDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
-            new File(topicDir).mkdirs();
 
             // Create topic in ZooKeeper
             String topicPath = "/topics/" + topic;
@@ -1050,8 +1338,6 @@ public class SimpleKafkaBroker {
 
             for (int i = 0; i < numPartitions; i++) {
                 int partitionId = i;
-                String partitionDir = topicDir + File.separator + partitionId;
-                new File(partitionDir).mkdirs();
 
                 // Select leader and followers
                 int leaderIndex = i % brokerIds.size();
@@ -1064,7 +1350,10 @@ public class SimpleKafkaBroker {
                 }
 
                 // Create partition
-                Partition partition = new Partition(partitionId, leaderId, followers, partitionDir);
+                String partitionDir = topicDir + File.separator + partitionId;
+                Partition partition = new Partition(
+                        partitionId, leaderId, followers, partitionDir,
+                        storesPartition(leaderId, followers));
                 partitions.add(partition);
 
                 // Store partition metadata in ZooKeeper

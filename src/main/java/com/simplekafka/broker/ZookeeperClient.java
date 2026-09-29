@@ -42,7 +42,10 @@ public class ZookeeperClient implements Watcher {
         // Create required paths if they don't exist
         createPath("/brokers");
         createPath("/topics");
-        createPath("/controller");
+        // /controller is deliberately NOT created here. It has to be the ephemeral
+        // node of whichever broker won the election; an empty persistent placeholder
+        // would sit in front of it forever and make every broker fight over who gets
+        // to delete it before it can elect anyone.
     }
     
     /**
@@ -76,17 +79,72 @@ public class ZookeeperClient implements Watcher {
     }
     
     /**
-     * Create an ephemeral node
+     * Create an ephemeral node, but only if it does not exist yet.
+     *
+     * <p>The create <em>is</em> the existence check: ZooKeeper rejects a create that
+     * lost a race with another broker, and that rejection is reported as
+     * {@code false} instead of being thrown. "Somebody else got there first" is the
+     * normal outcome for every participant but one, so it must not surface as an
+     * exception the caller has to log as a failure.
+     *
+     * @return true when this call created the node
      */
     public boolean createEphemeralNode(String path, String data) throws KeeperException, InterruptedException {
-        Stat stat = zooKeeper.exists(path, false);
-        if (stat == null) {
+        try {
             zooKeeper.create(path, data.getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
             LOGGER.info("Created ephemeral node: " + path);
             return true;
-        } else {
+        } catch (KeeperException.NodeExistsException e) {
             LOGGER.info("Ephemeral node already exists: " + path);
             return false;
+        }
+    }
+
+    /**
+     * Delete a stale, empty placeholder node.
+     *
+     * <p>Older versions of this broker created {@code /controller} as an empty
+     * persistent node on startup, which would block every later election. The delete
+     * carries the version that was read so it fails instead of removing a node that
+     * somebody replaced in between, and only persistent nodes qualify, so a live
+     * controller's ephemeral node can never be deleted this way.
+     *
+     * @return true when this call removed the placeholder
+     */
+    public boolean deleteEmptyNode(String path) throws KeeperException, InterruptedException {
+        Stat stat = new Stat();
+        byte[] data;
+        try {
+            data = zooKeeper.getData(path, false, stat);
+        } catch (KeeperException.NoNodeException e) {
+            return false;
+        }
+
+        if (stat.getEphemeralOwner() != 0 || (data != null && data.length > 0)) {
+            return false; // a live node, not a leftover placeholder
+        }
+
+        try {
+            zooKeeper.delete(path, stat.getVersion());
+            LOGGER.info("Deleted stale empty node: " + path);
+            return true;
+        } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
+            return false; // somebody else changed or removed it first
+        }
+    }
+
+    /**
+     * Read a node's data, or null when the node is not there (any more).
+     *
+     * <p>Used where a missing node is an expected state - the controller can vanish
+     * again at any moment - rather than an error worth a stack trace.
+     */
+    public String readDataIfPresent(String path) throws KeeperException, InterruptedException {
+        try {
+            byte[] data = zooKeeper.getData(path, false, null);
+            return data == null ? "" : new String(data);
+        } catch (KeeperException.NoNodeException e) {
+            return null;
         }
     }
     
@@ -193,15 +251,8 @@ public class ZookeeperClient implements Watcher {
         }
     }
     
-    /**
-     * Delete a node
-     */
-    public void deleteNode(String path) throws KeeperException, InterruptedException {
-        if (exists(path)) {
-            zooKeeper.delete(path, -1);
-            LOGGER.info("Deleted node: " + path);
-        }
-    }
+    // Note: there is deliberately no exists-then-delete helper any more. It was the
+    // primitive that let two brokers remove each other's freshly elected controller.
     
     /**
      * Process ZooKeeper events

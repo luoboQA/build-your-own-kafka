@@ -6,6 +6,7 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -26,6 +27,7 @@ public class Partition {
     private int leader;
     private List<Integer> followers;
     private final String baseDir;
+    private final boolean localReplica;
     private final AtomicLong nextOffset;
     private final ReadWriteLock lock;
     private RandomAccessFile activeLogFile;
@@ -33,15 +35,39 @@ public class Partition {
     private final List<SegmentInfo> segments;
     
     public Partition(int id, int leader, List<Integer> followers, String baseDir) {
+        this(id, leader, followers, baseDir, true);
+    }
+    
+    /**
+     * @param localReplica whether this broker is the leader or one of the followers of
+     *        the partition and therefore actually stores its log. A broker that only
+     *        knows about a partition (so it can answer metadata requests and forward
+     *        writes to the leader) keeps the assignment without creating any files:
+     *        an empty log of its own would let the broker start writing at offset 0
+     *        if it were ever elected leader for real data.
+     */
+    public Partition(int id, int leader, List<Integer> followers, String baseDir, boolean localReplica) {
         this.id = id;
         this.leader = leader;
         this.followers = followers;
         this.baseDir = baseDir;
+        this.localReplica = localReplica;
         this.nextOffset = new AtomicLong(0);
         this.lock = new ReentrantReadWriteLock();
         this.segments = new ArrayList<>();
         
-        initialize();
+        if (localReplica) {
+            initialize();
+        } else {
+            LOGGER.info("Partition " + id + " is not replicated on this broker, keeping its assignment only");
+        }
+    }
+    
+    /**
+     * Whether this broker stores the log of this partition
+     */
+    public boolean isLocalReplica() {
+        return localReplica;
     }
     
     /**
@@ -170,11 +196,82 @@ public class Partition {
     }
     
     /**
-     * Append a message to the log
+     * Append a message to the log.
      * @return the offset where the message was appended
      */
     public long append(byte[] message) {
+        if (!localReplica) {
+            // This broker does not store the partition, so it must not start a log
+            // of its own at offset 0 while the real replicas already hold data.
+            LOGGER.warning("Partition " + id + " has no local log on this broker");
+            return -1;
+        }
+
         lock.writeLock().lock();
+        try {
+            return doAppend(message);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Append a message at the offset picked by the partition leader.
+     *
+     * <p>A replica never chooses its own offsets: if it did, the same offset could
+     * hold different data on different brokers once a message was lost or arrives
+     * out of order, and consumers reading that offset would see different data
+     * depending on which replica they hit.
+     *
+     * @param offset the offset the leader assigned to {@code message}
+     * @param message the message body
+     * @return {@code offset} when the replica's log now holds {@code message} at
+     *         {@code offset}; {@code -1} when {@code offset} is ahead of this
+     *         replica's log end offset (messages are missing); {@code -2} on failure
+     */
+    public long appendAt(long offset, byte[] message) {
+        if (!localReplica || offset < 0) {
+            return -2;
+        }
+
+        lock.writeLock().lock();
+        try {
+            long logEndOffset = nextOffset.get();
+
+            if (offset > logEndOffset) {
+                // The leader is ahead of us: messages [logEndOffset, offset) never
+                // arrived. Refuse instead of silently writing at the wrong place.
+                return -1;
+            }
+
+            if (offset < logEndOffset) {
+                byte[] existing = readMessageAt(offset);
+                if (existing != null && Arrays.equals(existing, message)) {
+                    // A retry of a request we already applied: nothing to do.
+                    return offset;
+                }
+
+                // Our log no longer matches the leader's from this offset onwards.
+                // Drop the diverged suffix and rewrite the leader's version.
+                LOGGER.warning("Log of partition " + id + " diverged from the leader at offset " +
+                        offset + "; truncating");
+                if (!truncateFrom(offset)) {
+                    return -2;
+                }
+            }
+
+            long written = doAppend(message);
+            return written == offset ? offset : -2;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Append at whatever the current end of the log is. Callers must hold the write lock.
+     * @return the offset where the message was appended, or -1 on failure
+     */
+    private long doAppend(byte[] message) {
         try {
             long currentOffset = nextOffset.get();
             
@@ -208,8 +305,159 @@ public class Partition {
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to append message to partition " + id, e);
             return -1;
-        } finally {
-            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Read the message stored at a single offset, or null when it cannot be read.
+     * Used by {@link #appendAt} to decide whether an existing offset already holds
+     * the leader's copy of the message.
+     */
+    private byte[] readMessageAt(long offset) {
+        try {
+            SegmentInfo segment = findSegmentForOffset(offset);
+            if (segment == null) {
+                return null;
+            }
+
+            long position = scanPositionForOffset(segment, offset - segment.getBaseOffset());
+            if (position < 0) {
+                return null;
+            }
+
+            try (RandomAccessFile logFile = new RandomAccessFile(segment.getLogPath(), "r");
+                 FileChannel logChannel = logFile.getChannel()) {
+
+                ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
+                logChannel.position(position);
+                if (logChannel.read(sizeBuffer) < 4) {
+                    return null;
+                }
+                sizeBuffer.flip();
+
+                int messageSize = sizeBuffer.getInt();
+                if (messageSize < 0 || position + 4 + messageSize > logChannel.size()) {
+                    return null;
+                }
+
+                ByteBuffer messageBuffer = ByteBuffer.allocate(messageSize);
+                if (logChannel.read(messageBuffer) < messageSize) {
+                    return null;
+                }
+                messageBuffer.flip();
+
+                byte[] message = new byte[messageSize];
+                messageBuffer.get(message);
+                return message;
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to read message at offset " + offset + " of partition " + id, e);
+            return null;
+        }
+    }
+
+    /**
+     * Byte position of the message with the given offset relative to the start of
+     * the segment, found by walking the file. Walking is cheap for a segment and,
+     * unlike the index lookup, it cannot be off by one message.
+     */
+    private long scanPositionForOffset(SegmentInfo segment, long relativeOffset) throws IOException {
+        if (relativeOffset < 0) {
+            return -1;
+        }
+
+        try (RandomAccessFile logFile = new RandomAccessFile(segment.getLogPath(), "r");
+             FileChannel logChannel = logFile.getChannel()) {
+
+            long position = 0;
+            long current = 0;
+            ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
+
+            while (position < logChannel.size()) {
+                if (current == relativeOffset) {
+                    return position;
+                }
+
+                sizeBuffer.clear();
+                logChannel.position(position);
+                if (logChannel.read(sizeBuffer) < 4) {
+                    return -1;
+                }
+                sizeBuffer.flip();
+
+                int messageSize = sizeBuffer.getInt();
+                if (messageSize < 0 || position + 4 + messageSize > logChannel.size()) {
+                    return -1;
+                }
+
+                position += 4 + messageSize;
+                current++;
+            }
+
+            return current == relativeOffset ? position : -1;
+        }
+    }
+
+    /**
+     * Drop every message from {@code offset} onwards so the log ends exactly where
+     * the leader's log ends, ready for the leader's version to be rewritten.
+     * Callers must hold the write lock.
+     * @return true when the log now ends at {@code offset}
+     */
+    private boolean truncateFrom(long offset) {
+        try {
+            long logEndOffset = nextOffset.get();
+            if (offset >= logEndOffset) {
+                return true;
+            }
+
+            SegmentInfo target = findSegmentForOffset(offset);
+            if (target == null) {
+                return false;
+            }
+
+            long position = scanPositionForOffset(target, offset - target.getBaseOffset());
+            if (position < 0) {
+                return false;
+            }
+
+            // Release the active segment before modifying its files on disk.
+            if (activeLogChannel != null) {
+                activeLogChannel.close();
+                activeLogChannel = null;
+            }
+            if (activeLogFile != null) {
+                activeLogFile.close();
+                activeLogFile = null;
+            }
+
+            // Remove every segment that starts at or after the diverged offset.
+            int targetIndex = segments.indexOf(target);
+            for (int i = segments.size() - 1; i > targetIndex; i--) {
+                SegmentInfo segment = segments.get(i);
+                new File(segment.getLogPath()).delete();
+                new File(segment.getIndexPath()).delete();
+                segments.remove(i);
+            }
+
+            // Cut the surviving segment right where the divergence starts.
+            try (RandomAccessFile logFile = new RandomAccessFile(target.getLogPath(), "rw")) {
+                logFile.setLength(position);
+            }
+
+            long relativeOffset = offset - target.getBaseOffset();
+            try (RandomAccessFile indexFile = new RandomAccessFile(target.getIndexPath(), "rw")) {
+                indexFile.setLength(relativeOffset * 16);
+            }
+
+            nextOffset.set(offset);
+            openSegmentForAppend(target);
+
+            LOGGER.info("Truncated partition " + id + " back to offset " + offset);
+            return true;
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Failed to truncate partition " + id + " at offset " + offset, e);
+            return false;
         }
     }
     
@@ -247,8 +495,12 @@ public class Partition {
      * Read messages from the log starting at offset
      */
     public List<byte[]> readMessages(long offset, int maxBytes) {
-        lock.readLock().lock();
         List<byte[]> messages = new ArrayList<>();
+        if (!localReplica) {
+            return messages;
+        }
+
+        lock.readLock().lock();
         int bytesRead = 0;
         
         try {
@@ -264,9 +516,11 @@ public class Partition {
                 return messages;
             }
             
-            // Open the log file for reading
-            try (RandomAccessFile logFile = new RandomAccessFile(targetSegment.getLogPath(), "r");
-                 FileChannel logChannel = logFile.getChannel()) {
+            // Open the log file for reading. The handle is swapped for the next segment
+            // when the read runs past the end of this one, so it is managed explicitly.
+            RandomAccessFile logFile = new RandomAccessFile(targetSegment.getLogPath(), "r");
+            try {
+                FileChannel logChannel = logFile.getChannel();
                 
                 // Position at the correct spot
                 logChannel.position(position);
@@ -313,20 +567,19 @@ public class Partition {
                     if (logChannel.position() >= logChannel.size() && currentOffset < nextOffset.get()) {
                         int nextSegmentIndex = segments.indexOf(targetSegment) + 1;
                         if (nextSegmentIndex < segments.size()) {
-                            logChannel.close();
-                            logFile.close();
-                            
                             targetSegment = segments.get(nextSegmentIndex);
                             
-                            RandomAccessFile nextLogFile = new RandomAccessFile(targetSegment.getLogPath(), "r");
-                            FileChannel nextLogChannel = nextLogFile.getChannel();
-                            
-                            // Continue reading from the beginning of next segment
+                            // Carry on at the start of the next segment's file
+                            logFile.close();
+                            logFile = new RandomAccessFile(targetSegment.getLogPath(), "r");
+                            logChannel = logFile.getChannel();
                             position = 0;
-                            nextLogChannel.position(position);
+                            logChannel.position(position);
                         }
                     }
                 }
+            } finally {
+                logFile.close();
             }
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to read messages from partition " + id, e);

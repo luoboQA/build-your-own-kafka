@@ -27,6 +27,25 @@ public class Protocol {
     public static final byte REPLICATE = 0x21;
     public static final byte REPLICATE_ACK = 0x22;
     public static final byte TOPIC_NOTIFICATION = 0x23;
+    /** The follower cannot write at the offset the leader picked (its log is behind). */
+    public static final byte REPLICATE_NACK = 0x24;
+    /** The follower does not know the topic/partition, or the write failed. */
+    public static final byte REPLICATE_FAILED = 0x00;
+
+    /**
+     * Replication responses are {@code [1 byte status][8 bytes log end offset]}.
+     * The log end offset tells the leader where the follower stopped, so it can
+     * re-send everything the follower is missing.
+     */
+    public static final int REPLICATION_RESPONSE_SIZE = 9;
+    /** Upper bound for a single socket write performed by the protocol helpers. */
+    public static final long DEFAULT_IO_TIMEOUT_MS = 10_000;
+    /**
+     * How long a produce may take end to end. The leader waits for its followers to
+     * store the message before it answers, so the reply can arrive much later than a
+     * local append would take - and the wait has to be bounded somewhere.
+     */
+    public static final long PRODUCE_RESPONSE_TIMEOUT_MS = 30_000;
     
     /**
      * Send an error response to the client
@@ -95,7 +114,10 @@ public class Protocol {
     }
     
     /**
-     * Encode a replication request
+     * Encode a replication request.
+     *
+     * <p>{@code offset} is the position the <em>leader</em> assigned to the message;
+     * the follower must write it there rather than at its own log end offset.
      */
     public static ByteBuffer encodeReplicateRequest(String topic, int partition, long offset, byte[] message) {
         // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
@@ -122,7 +144,112 @@ public class Protocol {
         buffer.flip();
         return buffer;
     }
+
+    /**
+     * Encode a replication response: status plus the follower's log end offset
+     */
+    public static ByteBuffer encodeReplicationResponse(byte status, long logEndOffset) {
+        ByteBuffer buffer = ByteBuffer.allocate(REPLICATION_RESPONSE_SIZE);
+        buffer.put(status);
+        buffer.putLong(logEndOffset);
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * Read exactly {@code buffer.remaining()} bytes from the channel, looping over
+     * partial reads. A single {@code channel.read()} may return fewer bytes than
+     * asked for, which would otherwise leave the response half parsed.
+     */
+    public static void readFully(SocketChannel channel, ByteBuffer buffer, long timeoutMillis) throws IOException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        boolean wasBlocking = channel.isBlocking();
+        channel.configureBlocking(false);
+        try {
+            while (buffer.hasRemaining()) {
+                int read = channel.read(buffer);
+                if (read < 0) {
+                    throw new IOException("Connection closed after " + buffer.position() +
+                            " of " + buffer.limit() + " bytes");
+                }
+                if (read == 0) {
+                    if (System.currentTimeMillis() > deadline) {
+                        throw new IOException("Timed out after " + timeoutMillis + "ms with " +
+                                buffer.remaining() + " bytes still missing");
+                    }
+                    Thread.sleep(2);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while reading from channel", e);
+        } finally {
+            channel.configureBlocking(wasBlocking);
+        }
+    }
+
+    /**
+     * Write the whole buffer, looping over partial writes
+     */
+    public static void writeFully(SocketChannel channel, ByteBuffer buffer) throws IOException {
+        long deadline = System.currentTimeMillis() + DEFAULT_IO_TIMEOUT_MS;
+        while (buffer.hasRemaining()) {
+            int written = channel.write(buffer);
+            if (written == 0) {
+                // Nothing could be handed to the socket: back off instead of spinning.
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IOException("Timed out writing " + buffer.remaining() + " bytes");
+                }
+                try {
+                    Thread.sleep(2);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while writing to channel", e);
+                }
+            }
+        }
+    }
     
+    /**
+     * Read exactly one produce response frame.
+     *
+     * <p>Produce replies are either the fixed 10 byte success frame or an error frame
+     * that carries its own length, so the frame is read by its shape instead of
+     * hoping one {@code read()} returns all of it. The leader now waits for its
+     * followers before answering, which makes a late or split reply much more likely
+     * than it was when produce returned right after the local append.
+     *
+     * @return the complete frame, ready for {@link #decodeProduceResponse}
+     */
+    public static ByteBuffer readProduceResponse(SocketChannel channel, long timeoutMillis) throws IOException {
+        ByteBuffer type = ByteBuffer.allocate(1);
+        readFully(channel, type, timeoutMillis);
+        type.flip();
+        byte responseType = type.get();
+
+        int frameLength;
+        if (responseType == PRODUCE_RESPONSE) {
+            frameLength = 9; // offset + status
+        } else if (responseType == ERROR_RESPONSE) {
+            ByteBuffer length = ByteBuffer.allocate(2);
+            readFully(channel, length, timeoutMillis);
+            length.flip();
+            frameLength = 2 + (length.getShort() & 0xFFFF);
+        } else {
+            throw new IOException("Unexpected produce response type: " + responseType);
+        }
+
+        ByteBuffer rest = ByteBuffer.allocate(frameLength);
+        readFully(channel, rest, timeoutMillis);
+        rest.flip();
+
+        ByteBuffer frame = ByteBuffer.allocate(1 + frameLength);
+        frame.put(responseType);
+        frame.put(rest);
+        frame.flip();
+        return frame;
+    }
+
     /**
      * Decode a produce response
      */
