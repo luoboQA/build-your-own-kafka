@@ -1,5 +1,6 @@
 package com.simplekafka.broker;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -23,6 +24,7 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.zookeeper.CreateMode;
@@ -277,6 +279,61 @@ class ReplicationOffsetTest {
         File outsiderTopicDir = new File("data/" + outsider + "/" + topic);
         assertFalse(outsiderTopicDir.exists(),
                 "broker " + outsider + " is not a replica of " + topic + " but has " + outsiderTopicDir);
+    }
+
+    @Test
+    void onlyTheLeaderServesReads() throws Exception {
+        String topic = newTopic();
+        createTopic(topic, 1, (short) 2);
+
+        int leader = leaderOf(topic, 0);
+        int follower = other(leader);
+        client.send(topic, 0, bytes("only-the-leader-answers-reads"));
+
+        Protocol.FetchResult servedByLeader = fetchFrom(portFor(leader), topic, 0, 0, 4096);
+        assertTrue(servedByLeader.isSuccess(), "the leader must serve reads");
+        assertEquals(1, servedByLeader.getMessages().length);
+        assertEquals("only-the-leader-answers-reads", new String(servedByLeader.getMessages()[0],
+                StandardCharsets.UTF_8));
+
+        // The follower holds exactly the same bytes on disk and still must not answer.
+        // A lagging follower's short log looks identical to an empty partition from the
+        // outside, so a consumer could never tell a hole from "nothing here yet".
+        Protocol.FetchResult servedByFollower = fetchFrom(portFor(follower), topic, 0, 0, 4096);
+        assertFalse(servedByFollower.isSuccess(), "a follower must not serve reads");
+        assertTrue(servedByFollower.getError().contains("leader"),
+                "the refusal should name the leader, but was: " + servedByFollower.getError());
+    }
+
+    @Test
+    void aMessageTooLargeForOneReadSurvivesTheRoundTrip() throws Exception {
+        String topic = newTopic();
+        createTopic(topic, 1, (short) 2);
+
+        // Comfortably larger than the 1024-byte buffer the broker once used to hold a
+        // whole request, so this cannot pass unless the frame is reassembled from its
+        // own header - and it is fetched back to prove the reply is framed too.
+        byte[] payload = new byte[64 * 1024];
+        ThreadLocalRandom.current().nextBytes(payload);
+
+        assertEquals(0, client.send(topic, 0, payload));
+
+        List<byte[]> fetched = client.fetch(topic, 0, 0, payload.length + 4096);
+        assertEquals(1, fetched.size(), "the broker must hand back the whole message");
+        assertArrayEquals(payload, fetched.get(0), "the message must come back byte for byte");
+    }
+
+    /**
+     * Fetch from one specific broker, so a test can tell exactly which broker answered
+     * instead of whichever one it happened to reach.
+     */
+    private static Protocol.FetchResult fetchFrom(int port, String topic, int partition, long offset, int maxBytes)
+            throws IOException {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.connect(new InetSocketAddress("127.0.0.1", port));
+            Protocol.writeFully(channel, Protocol.encodeFetchRequest(topic, partition, offset, maxBytes));
+            return Protocol.readFetchResponse(channel, 30_000);
+        }
     }
 
     @Test

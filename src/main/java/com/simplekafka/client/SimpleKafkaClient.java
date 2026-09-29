@@ -263,19 +263,13 @@ public class SimpleKafkaClient {
             
             // Send fetch request
             ByteBuffer request = Protocol.encodeFetchRequest(topic, partition, offset, maxBytes);
-            channel.write(request);
-            
-            // Read response
-            ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
-            int bytesRead = channel.read(response);
-            if (bytesRead <= 0) {
-                throw new IOException("No data received from broker");
-            }
-            
-            response.flip();
-            
-            Protocol.FetchResult result = Protocol.decodeFetchResponse(response);
-            
+            Protocol.writeFully(channel, request);
+
+            // Read response. A fetch answer can be far larger than a socket buffer, so it
+            // is walked frame by frame instead of read once and hoped for.
+            Protocol.FetchResult result =
+                    Protocol.readFetchResponse(channel, Protocol.DEFAULT_IO_TIMEOUT_MS);
+
             if (!result.isSuccess()) {
                 throw new IOException("Failed to fetch messages: " + result.getError());
             }

@@ -46,6 +46,13 @@ public class Protocol {
      * local append would take - and the wait has to be bounded somewhere.
      */
     public static final long PRODUCE_RESPONSE_TIMEOUT_MS = 30_000;
+    /**
+     * Sanity bounds for a fetch reply. Nothing on this wire can legitimately exceed
+     * them, so a larger value means the frame is corrupt rather than merely big -
+     * and without the bound a bad length would be handed straight to the allocator.
+     */
+    public static final int MAX_FETCH_RECORDS = 1_000_000;
+    public static final int MAX_FETCH_RECORD_BYTES = 16 * 1024 * 1024;
     
     /**
      * Send an error response to the client
@@ -56,7 +63,7 @@ public class Protocol {
         buffer.putShort((short) errorMessage.length());
         buffer.put(errorMessage.getBytes());
         buffer.flip();
-        channel.write(buffer);
+        writeFully(channel, buffer);
     }
     
     /**
@@ -251,6 +258,79 @@ public class Protocol {
     }
 
     /**
+     * Read exactly one fetch response.
+     *
+     * <p>Same reason as {@link #readProduceResponse}: there is no length prefix for
+     * the whole reply and one {@code read()} may return a fragment, so the reader has
+     * to follow the frame's own structure - count, then each record's length - rather
+     * than stop when the socket goes quiet. That matters far more here than for a
+     * produce reply, because a fetch answer is the one place where a large message is
+     * actually sent back to the caller.
+     *
+     * @return the decoded reply, either the records or the broker's error text
+     */
+    public static FetchResult readFetchResponse(SocketChannel channel, long timeoutMillis) throws IOException {
+        ByteBuffer type = ByteBuffer.allocate(1);
+        readFully(channel, type, timeoutMillis);
+        type.flip();
+        byte responseType = type.get();
+
+        if (responseType == ERROR_RESPONSE) {
+            return new FetchResult(new byte[0][], readErrorText(channel, timeoutMillis));
+        }
+        if (responseType != FETCH_RESPONSE) {
+            throw new IOException("Unexpected fetch response type: " + responseType);
+        }
+
+        ByteBuffer count = ByteBuffer.allocate(4);
+        readFully(channel, count, timeoutMillis);
+        count.flip();
+        int messageCount = count.getInt();
+        if (messageCount < 0 || messageCount > MAX_FETCH_RECORDS) {
+            throw new IOException("Implausible fetch response with " + messageCount + " records");
+        }
+
+        byte[][] messages = new byte[messageCount][];
+        for (int i = 0; i < messageCount; i++) {
+            ByteBuffer header = ByteBuffer.allocate(12); // offset + record length
+            readFully(channel, header, timeoutMillis);
+            header.flip();
+            header.getLong(); // the caller passed its own offset; it does not need it back
+            int size = header.getInt();
+            if (size < 0 || size > MAX_FETCH_RECORD_BYTES) {
+                throw new IOException("Implausible record size: " + size);
+            }
+
+            ByteBuffer payload = ByteBuffer.allocate(size);
+            readFully(channel, payload, timeoutMillis);
+            payload.flip();
+            messages[i] = new byte[size];
+            payload.get(messages[i]);
+        }
+
+        return new FetchResult(messages, null);
+    }
+
+    /**
+     * Read the text of an {@link #ERROR_RESPONSE} that has already had its type byte
+     * consumed. Its length is a unsigned short, so the payload is bounded at 64KB and
+     * needs no further policing.
+     */
+    private static String readErrorText(SocketChannel channel, long timeoutMillis) throws IOException {
+        ByteBuffer length = ByteBuffer.allocate(2);
+        readFully(channel, length, timeoutMillis);
+        length.flip();
+        int errorLength = length.getShort() & 0xFFFF;
+
+        ByteBuffer text = ByteBuffer.allocate(errorLength);
+        readFully(channel, text, timeoutMillis);
+        text.flip();
+        byte[] bytes = new byte[errorLength];
+        text.get(bytes);
+        return new String(bytes);
+    }
+
+    /**
      * Decode a produce response
      */
     public static ProduceResult decodeProduceResponse(ByteBuffer buffer) {
@@ -270,35 +350,6 @@ public class Protocol {
         byte status = buffer.get();
         
         return new ProduceResult(offset, status == 0 ? null : "Produce failed");
-    }
-    
-    /**
-     * Decode a fetch response
-     */
-    public static FetchResult decodeFetchResponse(ByteBuffer buffer) {
-        byte responseType = buffer.get();
-        if (responseType != FETCH_RESPONSE) {
-            if (responseType == ERROR_RESPONSE) {
-                short errorLength = buffer.getShort();
-                byte[] errorBytes = new byte[errorLength];
-                buffer.get(errorBytes);
-                String error = new String(errorBytes);
-                return new FetchResult(new byte[0][], error);
-            }
-            return new FetchResult(new byte[0][], "Invalid response type");
-        }
-        
-        int messageCount = buffer.getInt();
-        byte[][] messages = new byte[messageCount][];
-        
-        for (int i = 0; i < messageCount; i++) {
-            long offset = buffer.getLong(); // Skip offset
-            int messageSize = buffer.getInt();
-            messages[i] = new byte[messageSize];
-            buffer.get(messages[i]);
-        }
-        
-        return new FetchResult(messages, null);
     }
     
     /**

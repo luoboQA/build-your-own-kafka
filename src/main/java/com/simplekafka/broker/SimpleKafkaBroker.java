@@ -46,6 +46,18 @@ public class SimpleKafkaBroker {
     private final Map<String, ExecutorService> replicationExecutors = new ConcurrentHashMap<>();
     /** How long the leader waits for a follower to answer a replication request. */
     private static final long REPLICATION_TIMEOUT_MS = 10_000;
+    /**
+     * The largest request the broker will reassemble. The frame is measured from the
+     * request's own header rather than assumed, so this is a ceiling rather than a
+     * buffer size - the analogue of Kafka's {@code message.max.bytes}.
+     */
+    private static final int MAX_REQUEST_BYTES = 1024 * 1024;
+    /**
+     * Where partition assignments read back from ZooKeeper get applied. Watches fire
+     * on ZooKeeper's event thread, and the blocking reads needed here would stall
+     * every other watch this broker has open.
+     */
+    private final ExecutorService metadataExecutor;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -53,6 +65,11 @@ public class SimpleKafkaBroker {
         this.brokerPort = port;
         this.topics = new ConcurrentHashMap<>();
         this.executor = Executors.newFixedThreadPool(10);
+        this.metadataExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "partition-metadata-" + brokerId);
+            thread.setDaemon(true);
+            return thread;
+        });
         this.serverChannel = ServerSocketChannel.open();
         this.isRunning = new AtomicBoolean(false);
         this.isController = new AtomicBoolean(false);
@@ -152,32 +169,21 @@ public class SimpleKafkaBroker {
         for (String partitionId : partitionIds) {
             int id = Integer.parseInt(partitionId);
             String partitionPath = topicPath + "/partitions/" + partitionId;
-            String partitionData = zkClient.getData(partitionPath);
-
-            String[] parts = partitionData.split(";");
-            int leader = Integer.parseInt(parts[0]);
-
-            List<Integer> followers = new ArrayList<>();
-            if (parts.length > 1 && !parts[1].isEmpty()) {
-                String[] followerIds = parts[1].split(",");
-                for (String followerId : followerIds) {
-                    if (!followerId.isEmpty()) {
-                        followers.add(Integer.parseInt(followerId));
-                    }
-                }
-            }
+            Assignment assignment = parseAssignment(zkClient.getData(partitionPath));
 
             // Only a broker that actually replicates the partition gets a log
             // directory. Everyone else keeps the assignment (leader + followers)
             // so it can answer metadata requests and forward writes, but writing a
             // log file here would create an empty log starting at offset 0.
             String partitionDir = topicDir + File.separator + id;
-            Partition partition =
-                    new Partition(id, leader, followers, partitionDir, storesPartition(leader, followers));
+            Partition partition = new Partition(id, assignment.leader, assignment.followers, partitionDir,
+                    storesPartition(assignment.leader, assignment.followers));
             partitions.add(partition);
 
             LOGGER.info("Loaded partition " + id + " for topic " + topic +
-                    ", leader: " + leader + ", followers: " + followers);
+                    ", leader: " + assignment.leader + ", followers: " + assignment.followers);
+
+            watchPartitionAssignment(topic, partition);
         }
 
         topics.put(topic, partitions);
@@ -300,6 +306,11 @@ public class SimpleKafkaBroker {
                     replication.shutdown();
                 }
                 replicationExecutors.clear();
+
+                // Shut down the assignment watcher before closing ZooKeeper, so no
+                // watch callback can try to re-arm itself against a dead handle
+                metadataExecutor.shutdown();
+                metadataExecutor.awaitTermination(5, TimeUnit.SECONDS);
 
                 // Close ZooKeeper connection
                 zkClient.close();
@@ -477,7 +488,20 @@ public class SimpleKafkaBroker {
     }
 
     /**
-     * Rebalance partitions across available brokers
+     * Elect a leader for every partition whose leader has dropped out of the cluster.
+     *
+     * <p>The replica set - whoever was assigned to the partition - is what says who
+     * actually holds the log, so a failover moves the leader <em>within</em> that set
+     * and never invents one outside it. A broker outside it would be elected to lead a
+     * partition whose log it does not have, and every message the real replicas stored
+     * would become invisible. Kafka makes the same choice and calls the alternative
+     * "unclean leader election".
+     *
+     * <p>What this deliberately does not do is order the surviving replicas by log end
+     * offset. That requires each replica to publish how far it has got - an in-sync
+     * replica set - and without one every survivor has to be treated as equally caught
+     * up, which here they are, because the leader only acknowledges a produce once
+     * every replica has stored it.
      */
     private void rebalancePartitions() {
         if (!isController.get()) {
@@ -491,36 +515,59 @@ public class SimpleKafkaBroker {
             List<Partition> partitions = entry.getValue();
 
             for (Partition partition : partitions) {
-                // Ensure each partition has a leader
-                if (partition.getLeader() == -1 || !clusterMetadata.containsKey(partition.getLeader())) {
-                    // Assign a new leader
-                    List<Integer> brokers = new ArrayList<>(clusterMetadata.keySet());
-                    if (!brokers.isEmpty()) {
-                        int newLeader = brokers.get(0);
-                        partition.setLeader(newLeader);
+                if (partition.getLeader() != -1 && clusterMetadata.containsKey(partition.getLeader())) {
+                    continue; // still led by a broker that is up
+                }
 
-                        // Set other brokers as followers
-                        List<Integer> followers = new ArrayList<>();
-                        for (int i = 1; i < Math.min(brokers.size(), 3); i++) {
-                            followers.add(brokers.get(i));
-                        }
-                        partition.setFollowers(followers);
+                // The replica set: whoever the assignment gave this partition. The old
+                // leader is included because it may have come back.
+                List<Integer> replicas = new ArrayList<>();
+                if (partition.getLeader() != -1) {
+                    replicas.add(partition.getLeader());
+                }
+                replicas.addAll(partition.getFollowers());
 
-                        if (newLeader == brokerId && !partition.isLocalReplica()) {
-                            LOGGER.warning("Partition " + partition.getId() + " of topic " + topic +
-                                    " was reassigned to this broker, but this broker holds no log" +
-                                    " for it; writes to it will be rejected");
-                        }
-
-                        // Update partition metadata in ZooKeeper
-                        updatePartitionMetadata(topic, partition);
-
-                        LOGGER.info("Reassigned partition " + partition.getId() +
-                                " of topic " + topic +
-                                " to leader " + newLeader +
-                                " with followers " + followers);
+                List<Integer> alive = new ArrayList<>();
+                for (int replica : replicas) {
+                    if (clusterMetadata.containsKey(replica) && !alive.contains(replica)) {
+                        alive.add(replica);
                     }
                 }
+
+                if (alive.isEmpty()) {
+                    // Refuse to guess: an assignment that never existed carries no
+                    // replication factor to honour, and one whose every replica is gone
+                    // has nothing to elect from. Either way the answer is "still down",
+                    // not "whoever happens to be running".
+                    LOGGER.warning("Partition " + partition.getId() + " of topic " + topic + " has "
+                            + (replicas.isEmpty() ? "no replica assignment" : "no live replica (assigned " + replicas + ")")
+                            + "; leaving it unled until one appears");
+                    continue;
+                }
+
+                // Any survivor will do. Without an ISR there is nothing to rank them by,
+                // so the assignment's own order decides - arbitrary, but every candidate
+                // at least holds this partition's log, which no outsider can claim.
+                int newLeader = alive.get(0);
+                partition.setLeader(newLeader);
+
+                // The replica set itself is left exactly as assigned: a follower that is
+                // merely down keeps its place so it can catch up when it returns, and a
+                // failover must not quietly rewrite the replication factor.
+                if (newLeader == brokerId && !partition.isLocalReplica()) {
+                    LOGGER.warning("Partition " + partition.getId() + " of topic " + topic +
+                            " was reassigned to this broker, but this broker holds no log" +
+                            " for it; writes to it will be rejected");
+                }
+
+                // Update partition metadata in ZooKeeper
+                updatePartitionMetadata(topic, partition);
+
+                LOGGER.info("Reassigned partition " + partition.getId() +
+                        " of topic " + topic +
+                        " to leader " + newLeader +
+                        ", chosen from replica set " + replicas +
+                        "; followers stay at " + partition.getFollowers());
             }
         }
     }
@@ -544,6 +591,102 @@ public class SimpleKafkaBroker {
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to update partition metadata", e);
         }
+    }
+
+    /**
+     * A partition's leader plus the brokers that replicate it.
+     */
+    private static final class Assignment {
+        private final int leader;
+        private final List<Integer> followers;
+
+        private Assignment(int leader, List<Integer> followers) {
+            this.leader = leader;
+            this.followers = followers;
+        }
+    }
+
+    /**
+     * Parse the {@code leader;follower,follower,} blob a partition's ZooKeeper node
+     * holds. One shape, parsed in one place, so a leader change read back by a watch
+     * and a topic read at startup cannot end up disagreeing.
+     */
+    private static Assignment parseAssignment(String data) {
+        String[] parts = data.split(";");
+        int leader = Integer.parseInt(parts[0].trim());
+
+        List<Integer> followers = new ArrayList<>();
+        if (parts.length > 1 && !parts[1].isEmpty()) {
+            for (String followerId : parts[1].split(",")) {
+                if (!followerId.isEmpty()) {
+                    followers.add(Integer.parseInt(followerId));
+                }
+            }
+        }
+
+        return new Assignment(leader, followers);
+    }
+
+    /**
+     * Watch a partition's assignment in ZooKeeper so that a leader change decided by
+     * the controller reaches this broker.
+     *
+     * <p>Without this the controller would be the only broker that knows the new
+     * leader: everyone else would keep answering metadata with, and forwarding writes
+     * to, a broker that is gone. Watches are one-shot, so every notification re-arms
+     * itself, and the reading happens on {@link #metadataExecutor} rather than on
+     * ZooKeeper's event thread, which must never be blocked.
+     */
+    private void watchPartitionAssignment(String topic, Partition partition) {
+        if (!isRunning.get()) {
+            return;
+        }
+
+        String path = "/topics/" + topic + "/partitions/" + partition.getId();
+        try {
+            zkClient.watchNode(path, () -> {
+                if (!isRunning.get()) {
+                    return;
+                }
+                metadataExecutor.submit(() -> {
+                    try {
+                        applyPartitionAssignment(topic, partition);
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "Failed to apply the assignment of "
+                                + topic + "/" + partition.getId(), e);
+                    }
+                    watchPartitionAssignment(topic, partition);
+                });
+            });
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to watch the assignment of " + topic + "/" + partition.getId(), e);
+        }
+    }
+
+    /**
+     * Read a partition's assignment back from ZooKeeper and take it on if it differs
+     * from the one this broker is running with.
+     */
+    private void applyPartitionAssignment(String topic, Partition partition) throws Exception {
+        String path = "/topics/" + topic + "/partitions/" + partition.getId();
+        String data = zkClient.readDataIfPresent(path);
+        if (data == null || data.isEmpty()) {
+            return; // gone or never written; keep the assignment we already have
+        }
+
+        Assignment assignment = parseAssignment(data);
+        if (assignment.leader == partition.getLeader()
+                && assignment.followers.equals(partition.getFollowers())) {
+            return; // nothing moved
+        }
+
+        partition.setLeader(assignment.leader);
+        partition.setFollowers(assignment.followers);
+
+        LOGGER.info("Learned the new assignment of " + topic + "/" + partition.getId()
+                + " from ZooKeeper: leader " + assignment.leader
+                + ", followers " + assignment.followers
+                + (assignment.leader == brokerId ? " - this broker now leads it" : ""));
     }
 
     /**
@@ -572,26 +715,59 @@ public class SimpleKafkaBroker {
 
     /**
      * Handle client connection
+     *
+     * <p>Requests are reassembled instead of read in one shot. The wire carries no
+     * length prefix, one {@code read()} returns whatever fragment happened to be in
+     * the socket buffer, and a fixed buffer would put a hard ceiling on the size of a
+     * produced message. So the frame is measured from the type byte plus the lengths
+     * in the request's own header, only that frame is handed to the parser, and
+     * whatever arrived behind it stays buffered for the next request.
      */
     private void handleClient(SocketChannel clientChannel) {
+        ByteBuffer pending = ByteBuffer.allocate(1024);
+        long silentSince = 0L;
+
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(1024);
-
             while (clientChannel.isOpen() && isRunning.get()) {
-                buffer.clear();
-                int bytesRead = clientChannel.read(buffer);
+                int frameLength = requestLength(pending);
 
-                if (bytesRead > 0) {
-                    buffer.flip();
-                    // Process the message based on protocol
-                    processClientMessage(clientChannel, buffer);
-                } else if (bytesRead < 0) {
+                if (frameLength >= 0 && pending.position() >= frameLength) {
+                    silentSince = 0L;
+                    ByteBuffer frame = pending.duplicate();
+                    frame.clear();
+                    frame.limit(frameLength);
+                    dropConsumedBytes(pending, frameLength);
+                    processClientMessage(clientChannel, frame);
+                    continue;
+                }
+
+                if (frameLength > pending.capacity() || !pending.hasRemaining()) {
+                    pending = grow(pending, frameLength > 0 ? frameLength : pending.capacity() + 1);
+                }
+
+                int bytesRead = clientChannel.read(pending);
+                if (bytesRead < 0) {
                     // Connection closed by client
                     clientChannel.close();
                     break;
                 }
+                if (bytesRead > 0) {
+                    silentSince = 0L;
+                    continue;
+                }
 
-                Thread.sleep(50); // Small pause to prevent CPU spin
+                // Nothing arrived. A connection with no bytes at all is simply idle and
+                // worth waiting for; one already holding half a request will never
+                // finish it on its own, so give up instead of spinning on it forever.
+                if (pending.position() > 0) {
+                    long now = System.currentTimeMillis();
+                    if (silentSince == 0L) {
+                        silentSince = now;
+                    } else if (now - silentSince > Protocol.DEFAULT_IO_TIMEOUT_MS) {
+                        throw new IOException("Timed out halfway through a request");
+                    }
+                }
+                Thread.sleep(5);
             }
         } catch (Exception e) {
             if (isRunning.get()) {
@@ -609,7 +785,128 @@ public class SimpleKafkaBroker {
     }
 
     /**
+     * How long the request sitting at the front of {@code buffer} is, or -1 when not
+     * enough of it has arrived to tell.
+     *
+     * <p>Every request type carries its own lengths, so a frame can be measured
+     * without a length prefix - but only once its header has been read, which is why
+     * the answer is "keep reading" until then.
+     *
+     * <p>Keep this in step with {@link #processClientMessage}: every type it dispatches
+     * has to be measured here, or the parser is handed a truncated frame and fails
+     * partway through a request it was told was complete.
+     *
+     * @throws IOException if the header describes a request that cannot be honoured
+     */
+    private static int requestLength(ByteBuffer buffer) throws IOException {
+        int available = buffer.position();
+        if (available < 1) {
+            return -1;
+        }
+
+        byte[] bytes = buffer.array();
+        switch (bytes[0]) {
+            case Protocol.METADATA:
+                return checkRequestLength(1);
+            case Protocol.TOPIC_NOTIFICATION: {
+                // [type][topic length][topic]
+                if (available < 3) {
+                    return -1;
+                }
+                return checkRequestLength(3 + unsignedShort(bytes, 1));
+            }
+            case Protocol.FETCH: {
+                // [type][topic length][topic][partition][offset][max bytes]
+                if (available < 3) {
+                    return -1;
+                }
+                return checkRequestLength(19 + unsignedShort(bytes, 1));
+            }
+            case Protocol.CREATE_TOPIC: {
+                // [type][topic length][topic][partition count][replication factor]
+                if (available < 3) {
+                    return -1;
+                }
+                return checkRequestLength(9 + unsignedShort(bytes, 1));
+            }
+            case Protocol.PRODUCE: {
+                // [type][topic length][topic][partition][message length][message]
+                if (available < 3) {
+                    return -1;
+                }
+                int topicLength = unsignedShort(bytes, 1);
+                if (available < 11 + topicLength) {
+                    return -1;
+                }
+                return checkRequestLength(11 + topicLength + readInt(bytes, 7 + topicLength));
+            }
+            case Protocol.REPLICATE: {
+                // [type][topic length][topic][partition][offset][message length][message]
+                if (available < 3) {
+                    return -1;
+                }
+                int topicLength = unsignedShort(bytes, 1);
+                if (available < 19 + topicLength) {
+                    return -1;
+                }
+                return checkRequestLength(19 + topicLength + readInt(bytes, 15 + topicLength));
+            }
+            default:
+                // An unknown type has no header to measure, so consume just the type byte
+                // and let the dispatcher answer with an error, exactly as it did before.
+                return 1;
+        }
+    }
+
+    private static int checkRequestLength(int length) throws IOException {
+        if (length <= 0 || length > MAX_REQUEST_BYTES) {
+            throw new IOException("Implausible request length: " + length);
+        }
+        return length;
+    }
+
+    private static int unsignedShort(byte[] bytes, int index) {
+        return ((bytes[index] & 0xFF) << 8) | (bytes[index + 1] & 0xFF);
+    }
+
+    private static int readInt(byte[] bytes, int index) {
+        return ((bytes[index] & 0xFF) << 24) | ((bytes[index + 1] & 0xFF) << 16)
+                | ((bytes[index + 2] & 0xFF) << 8) | (bytes[index + 3] & 0xFF);
+    }
+
+    /**
+     * Remove the first {@code length} bytes of an accumulation buffer, keeping any
+     * request that arrived behind them.
+     */
+    private static void dropConsumedBytes(ByteBuffer buffer, int length) {
+        int rest = buffer.position() - length;
+        if (rest > 0) {
+            System.arraycopy(buffer.array(), length, buffer.array(), 0, rest);
+        }
+        buffer.position(rest);
+    }
+
+    /**
+     * Copy an accumulation buffer into a larger one so a request bigger than the
+     * current capacity can be reassembled.
+     */
+    private static ByteBuffer grow(ByteBuffer buffer, int required) throws IOException {
+        if (required > MAX_REQUEST_BYTES) {
+            throw new IOException("Request larger than " + MAX_REQUEST_BYTES + " bytes");
+        }
+        int size = Math.min(Math.max(buffer.capacity() * 2, required), MAX_REQUEST_BYTES);
+
+        ByteBuffer bigger = ByteBuffer.allocate(size);
+        buffer.flip();
+        bigger.put(buffer);
+        return bigger;
+    }
+
+    /**
      * Process client message based on SimpleKafka wire protocol
+     *
+     * <p>Every case here needs a matching measurement in {@link #requestLength},
+     * otherwise the frame arrives truncated and parsing stops halfway through.
      */
     private void processClientMessage(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
         byte messageType = buffer.get();
@@ -1107,6 +1404,17 @@ public class SimpleKafkaBroker {
             return;
         }
 
+        if (targetPartition.getLeader() != brokerId) {
+            // Only the leader answers reads. A follower's log may be behind, or absent
+            // altogether on a broker outside the replica set, and an empty answer would
+            // be indistinguishable from a genuinely empty partition - so refuse instead
+            // of handing back a hole the consumer cannot explain.
+            Protocol.sendErrorResponse(clientChannel,
+                    "Broker " + brokerId + " is not the leader for " + topic + "/" + partition
+                            + "; leader is " + targetPartition.getLeader());
+            return;
+        }
+
         // Check if the offset is valid
         if (offset >= targetPartition.getLogEndOffset()) {
             // No messages available at this offset
@@ -1114,7 +1422,7 @@ public class SimpleKafkaBroker {
             response.put(Protocol.FETCH_RESPONSE);
             response.putInt(0); // 0 messages
             response.flip();
-            clientChannel.write(response);
+            Protocol.writeFully(clientChannel, response);
             return;
         }
 
@@ -1140,7 +1448,7 @@ public class SimpleKafkaBroker {
         }
 
         response.flip();
-        clientChannel.write(response);
+        Protocol.writeFully(clientChannel, response);
     }
 
     /**
@@ -1207,7 +1515,7 @@ public class SimpleKafkaBroker {
         }
 
         response.flip();
-        clientChannel.write(response);
+        Protocol.writeFully(clientChannel, response);
     }
 
     /**
@@ -1369,6 +1677,11 @@ public class SimpleKafkaBroker {
                         " for topic " + topic +
                         " with leader " + leaderId +
                         " and followers " + followers);
+
+                // Arm the watch even though we just wrote the assignment ourselves: this
+                // broker may stop being the controller, and then it is the one that has
+                // to be told about somebody else's decision.
+                watchPartitionAssignment(topic, partition);
             }
 
             // Add topic to broker's metadata
