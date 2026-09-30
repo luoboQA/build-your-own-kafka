@@ -9,6 +9,11 @@
 #   4. exactly one broker wins the controller election, with no failures logged
 #   5. no SEVERE line anywhere
 #
+# It runs on its own ZooKeeper and its own broker ports rather than sharing
+# demo.sh's (2181 and 9091-9093), so it can be run with the demo cluster still
+# up and never stops anything it did not start. Override with SMOKE_ZK_PORT and
+# SMOKE_BASE_PORT.
+#
 # Usage: ./smoke.sh          (needs Docker for ZooKeeper)
 set -u
 cd "$(dirname "$0")"
@@ -16,48 +21,106 @@ cd "$(dirname "$0")"
 JAR=target/build-your-own-kafka-1.0-SNAPSHOT.jar
 TOPIC="smoke-$(date +%s)"
 WORK="${SMOKE_WORK:-$PWD/target/smoke}"
+ZK_CONTAINER="${SMOKE_ZK_CONTAINER:-zookeeper-smoke}"
+ZK_PORT="${SMOKE_ZK_PORT:-12181}"
+BASE_PORT="${SMOKE_BASE_PORT:-19090}"
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 cleanup() {
-  [ -f "$WORK/pids" ] && xargs -r kill < "$WORK/pids" 2>/dev/null
-  sleep 2
-  xargs -r kill -9 < "$WORK/pids" 2>/dev/null
-  docker rm -f zookeeper >/dev/null 2>&1
+  if [ -f "$WORK/pids" ]; then
+    xargs -r kill < "$WORK/pids" 2>/dev/null
+    sleep 2
+    xargs -r kill -9 < "$WORK/pids" 2>/dev/null
+  fi
+  docker rm -f "$ZK_CONTAINER" >/dev/null 2>&1
   rm -rf data/1/smoke-* data/2/smoke-* data/3/smoke-*
 }
 trap cleanup EXIT
 
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is required" >&2; exit 1; }
 
-if [ ! -f "$JAR" ]; then
+# Rebuild when the tree has moved on, so a run never reports on a stale jar.
+if [ ! -f "$JAR" ] || [ -n "$(find src pom.xml -newer "$JAR" -print -quit 2>/dev/null)" ]; then
   echo "building $JAR ..."
   mvn -q -DskipTests package
 fi
 [ -f "$JAR" ] || { echo "ERROR: $JAR not found" >&2; exit 1; }
 
-docker rm -f zookeeper >/dev/null 2>&1
-docker run -d --name zookeeper -p 2181:2181 zookeeper:3.8 >/dev/null
+# Refuse to start on occupied ports. Without this a leftover broker shows up as
+# three identical bind failures buried in the broker logs, and the run reports
+# the misleading "nothing was produced" instead of the real cause.
+BUSY=""
+for port in "$ZK_PORT" $(seq $((BASE_PORT + 1)) $((BASE_PORT + 3))); do
+  if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+    echo "ERROR: port $port is already in use:" >&2
+    ss -ltnp 2>/dev/null | grep -E "[:.]$port\b" | sed 's/^/  /' >&2
+    BUSY=1
+  fi
+done
+if [ -n "$BUSY" ]; then
+  echo "the smoke test needs $ZK_PORT and $((BASE_PORT + 1))-$((BASE_PORT + 3)) to itself." >&2
+  echo "stop whatever holds them, or point SMOKE_BASE_PORT / SMOKE_ZK_PORT at free ports." >&2
+  exit 1
+fi
+
+# This is smoke's own container, so clearing a leftover from an interrupted run
+# is ours to do - the demo cluster's ZooKeeper is a different container entirely.
+docker rm -f "$ZK_CONTAINER" >/dev/null 2>&1
+docker run -d --name "$ZK_CONTAINER" -p "$ZK_PORT":2181 zookeeper:3.8 >/dev/null
 for i in $(seq 1 40); do
-  docker exec zookeeper zkServer.sh status 2>/dev/null | grep -q Mode && break
+  docker exec "$ZK_CONTAINER" zkServer.sh status 2>/dev/null | grep -q Mode && break
   sleep 1
 done
 sleep 2
-echo "zookeeper up"
+echo "zookeeper up (localhost:$ZK_PORT)"
 
 for i in 1 2 3; do
-  port=$((9090 + i))
-  nohup java -cp "$JAR" com.simplekafka.broker.SimpleKafkaBroker "$i" localhost "$port" 2181 \
+  port=$((BASE_PORT + i))
+  nohup java -cp "$JAR" com.simplekafka.broker.SimpleKafkaBroker "$i" localhost "$port" "$ZK_PORT" \
       > "$WORK/broker$i.log" 2>&1 &
   echo $! >> "$WORK/pids"
 done
-sleep 6
-echo "brokers up"
+
+# Wait for each broker to actually listen. A fixed sleep cannot tell a started
+# broker from one that died on the way up, which is exactly how a bind failure
+# turned into "produced: 0".
+wait_for_broker() {
+  local i=$1
+  local port=$((BASE_PORT + i))
+  local pid
+  local reason="did not listen within 30s"
+  pid=$(sed -n "${i}p" "$WORK/pids")
+  for _ in $(seq 1 60); do
+    (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null && return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
+      reason="exited during startup"
+      break
+    fi
+    sleep 0.5
+  done
+  echo "  broker $i (localhost:$port) $reason:"
+  tail -20 "$WORK/broker$i.log" 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+brokers_up=1
+for i in 1 2 3; do
+  wait_for_broker "$i" || brokers_up=0
+done
+if [ "$brokers_up" != 1 ]; then
+  echo "SMOKE FAILED (brokers did not start)"
+  exit 1
+fi
+# Listening means the socket is bound; give the election and topic load a moment
+# to settle before the clients arrive, as the fixed sleep here used to.
+sleep 5
+echo "brokers up (localhost:$((BASE_PORT + 1))-$((BASE_PORT + 3)))"
 
 fail=0
 
 echo "--- produce (20 messages, 3 partitions, replication factor 2) ---"
 for round in 1 2; do
-  java -cp "$JAR" com.simplekafka.client.SimpleKafkaProducer localhost 9091 "$TOPIC" \
+  java -cp "$JAR" com.simplekafka.client.SimpleKafkaProducer localhost $((BASE_PORT + 1)) "$TOPIC" \
       > "$WORK/producer-$round.log" 2>&1
 done
 produced=$(grep -hc "^Sent message to offset" "$WORK"/producer-*.log | paste -sd+ | bc)
@@ -68,7 +131,7 @@ sleep 5
 echo "--- consume from each partition ---"
 consumed=0
 for p in 0 1 2; do
-  sleep 5 | java -cp "$JAR" com.simplekafka.client.SimpleKafkaConsumer localhost 9091 "$TOPIC" "$p" \
+  sleep 5 | java -cp "$JAR" com.simplekafka.client.SimpleKafkaConsumer localhost $((BASE_PORT + 1)) "$TOPIC" "$p" \
       > "$WORK/consumer-$p.log" 2>&1
   n=$(grep -c 'Received message' "$WORK/consumer-$p.log")
   echo "  partition $p: $n message(s) consumed"
