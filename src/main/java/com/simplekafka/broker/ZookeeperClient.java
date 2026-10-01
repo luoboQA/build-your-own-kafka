@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -24,13 +25,23 @@ public class ZookeeperClient implements Watcher {
     
     private final String host;
     private final int port;
+    private final long sessionTimeoutMillis;
     private ZooKeeper zooKeeper;
     private CountDownLatch connectedSignal = new CountDownLatch(1);
     private volatile SessionListener sessionListener;
-    
+
     public ZookeeperClient(String host, int port) {
+        this(host, port, SESSION_TIMEOUT);
+    }
+
+    /**
+     * Connect with a shorter wait than the session timeout. Exists so a test does not have
+     * to sit out the real one to watch a connection that never succeeds give up.
+     */
+    ZookeeperClient(String host, int port, long sessionTimeoutMillis) {
         this.host = host;
         this.port = port;
+        this.sessionTimeoutMillis = sessionTimeoutMillis;
     }
     
     /**
@@ -38,7 +49,13 @@ public class ZookeeperClient implements Watcher {
      */
     public void connect() throws IOException, InterruptedException {
         zooKeeper = new ZooKeeper(getConnectString(), SESSION_TIMEOUT, this);
-        connectedSignal.await();
+        if (!connectedSignal.await(sessionTimeoutMillis, TimeUnit.MILLISECONDS)) {
+            // Without a bound this waits for ever when ZooKeeper never answers, and the
+            // broker binds its port and sits there, listening and doing nothing, with no
+            // line in its log to say why.
+            throw new IOException("Timed out after " + sessionTimeoutMillis + "ms connecting to ZooKeeper at "
+                    + getConnectString());
+        }
         
         // Create required paths if they don't exist
         createPath("/brokers");
@@ -304,6 +321,20 @@ public class ZookeeperClient implements Watcher {
             LOGGER.warning("Disconnected from ZooKeeper");
         } else if (event.getState() == Event.KeeperState.Expired) {
             LOGGER.warning("ZooKeeper session expired, reconnecting...");
+            reconnectAfterExpiry();
+        }
+    }
+
+    /**
+     * Reconnect after the session ended, off ZooKeeper's event thread.
+     *
+     * <p>Everything below blocks - closing the old client joins its send thread, and the
+     * new one is waited on - and this method is called from the event thread of the client
+     * being closed. Blocking it stops it delivering the very replies that are being waited
+     * for.
+     */
+    private void reconnectAfterExpiry() {
+        Thread thread = new Thread(() -> {
             try {
                 if (zooKeeper != null) {
                     zooKeeper.close();
@@ -316,7 +347,9 @@ public class ZookeeperClient implements Watcher {
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to reconnect to ZooKeeper", e);
             }
-        }
+        }, "zookeeper-reconnect");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /**

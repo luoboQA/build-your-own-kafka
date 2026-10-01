@@ -330,8 +330,18 @@ public class SimpleKafkaBroker {
 
             LOGGER.info("SimpleKafka broker started on " + brokerHost + ":" + brokerPort);
 
-            // Register with ZooKeeper
-            registerWithZookeeper();
+            // Register with ZooKeeper. A broker that cannot reach it cannot join the
+            // cluster, and the accept loop has not been started yet - so this has to fail
+            // here and visibly, rather than leave a broker holding its port and doing
+            // nothing, which is what a swallowed failure used to look like.
+            try {
+                registerWithZookeeper();
+            } catch (Exception e) {
+                isRunning.set(false);
+                serverChannel.close();
+                throw new IOException("Cannot reach ZooKeeper at " + zkClient.getConnectString()
+                        + "; refusing to start", e);
+            }
 
             // Start controller election process
             electController();
@@ -390,13 +400,9 @@ public class SimpleKafkaBroker {
     /**
      * Register this broker with ZooKeeper
      */
-    private void registerWithZookeeper() {
-        try {
-            zkClient.connect();
-            joinCluster();
-        } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to register with ZooKeeper", e);
-        }
+    private void registerWithZookeeper() throws Exception {
+        zkClient.connect();
+        joinCluster();
     }
 
     /**
