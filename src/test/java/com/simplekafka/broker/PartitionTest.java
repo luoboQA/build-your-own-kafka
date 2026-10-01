@@ -295,6 +295,40 @@ class PartitionTest {
         });
     }
 
+    /**
+     * A truncation that fails partway used to leave the partition with no open log at
+     * all: the handles were released before the files were cut, so every later append
+     * found nothing to write to. Whatever went wrong, the partition has to come back
+     * to a state where it can still take writes.
+     */
+    @Test
+    void aTruncationThatFailsPartwayLeavesThePartitionUsable() throws Exception {
+        Partition partition = newPartition("failed-truncate");
+        partition.append(message("a"));
+        partition.append(message("b"));
+        partition.append(message("c"));
+
+        // Cutting the log succeeds, cutting the index does not - the failure lands after
+        // the handles have already been released.
+        Path index = tempDir.resolve("failed-truncate/00000000000000000000.index");
+        assertTrue(index.toFile().setWritable(false), "could not make the index read-only");
+
+        try {
+            assertEquals(-2, partition.appendAt(1, message("B")),
+                    "a truncation that could not complete must be reported, not assumed");
+        } finally {
+            index.toFile().setWritable(true);
+        }
+
+        // Losing the diverged suffix is the whole point of a truncation, so "a" survives
+        // and "b"/"c" do not. What must not happen is the partition staying unusable.
+        assertEquals(1, partition.append(message("d")),
+                "the partition must recover to a state that can still be appended to");
+        assertEquals(List.of("a", "d"), readAll(partition));
+        assertEquals(2, partition.getLogEndOffset());
+        partition.close();
+    }
+
     private static void appendRawBytes(Path file, byte[] bytes) throws Exception {
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
             channel.position(channel.size());

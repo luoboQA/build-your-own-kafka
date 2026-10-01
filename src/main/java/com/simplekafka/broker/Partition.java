@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -256,7 +257,17 @@ public class Partition {
             }
 
             if (offset < logEndOffset) {
-                byte[] existing = readMessageAt(offset);
+                byte[] existing;
+                try {
+                    existing = readMessageAt(offset);
+                } catch (IOException e) {
+                    // We could not read our own log, which is not evidence that it
+                    // disagrees with the leader's. Refusing is the safe answer; the
+                    // alternative below destroys a suffix that may well be correct.
+                    LOGGER.log(Level.WARNING, "Cannot read offset " + offset + " of partition " + id, e);
+                    return -2;
+                }
+
                 if (existing != null && Arrays.equals(existing, message)) {
                     // A retry of a request we already applied: nothing to do.
                     return offset;
@@ -367,46 +378,41 @@ public class Partition {
      * Used by {@link #appendAt} to decide whether an existing offset already holds
      * the leader's copy of the message.
      */
-    private byte[] readMessageAt(long offset) {
-        try {
-            SegmentInfo segment = findSegmentForOffset(offset);
-            if (segment == null) {
-                return null;
-            }
-
-            long position = scanPositionForOffset(segment, offset - segment.getBaseOffset());
-            if (position < 0) {
-                return null;
-            }
-
-            try (RandomAccessFile logFile = new RandomAccessFile(segment.getLogPath(), "r");
-                 FileChannel logChannel = logFile.getChannel()) {
-
-                ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
-                logChannel.position(position);
-                if (logChannel.read(sizeBuffer) < 4) {
-                    return null;
-                }
-                sizeBuffer.flip();
-
-                int messageSize = sizeBuffer.getInt();
-                if (messageSize < 0 || position + 4 + messageSize > logChannel.size()) {
-                    return null;
-                }
-
-                ByteBuffer messageBuffer = ByteBuffer.allocate(messageSize);
-                if (logChannel.read(messageBuffer) < messageSize) {
-                    return null;
-                }
-                messageBuffer.flip();
-
-                byte[] message = new byte[messageSize];
-                messageBuffer.get(message);
-                return message;
-            }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to read message at offset " + offset + " of partition " + id, e);
+    private byte[] readMessageAt(long offset) throws IOException {
+        SegmentInfo segment = findSegmentForOffset(offset);
+        if (segment == null) {
             return null;
+        }
+
+        long position = scanPositionForOffset(segment, offset - segment.getBaseOffset());
+        if (position < 0) {
+            return null;
+        }
+
+        try (RandomAccessFile logFile = new RandomAccessFile(segment.getLogPath(), "r");
+             FileChannel logChannel = logFile.getChannel()) {
+
+            ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
+            logChannel.position(position);
+            if (logChannel.read(sizeBuffer) < 4) {
+                return null;
+            }
+            sizeBuffer.flip();
+
+            int messageSize = sizeBuffer.getInt();
+            if (messageSize < 0 || position + 4 + messageSize > logChannel.size()) {
+                return null;
+            }
+
+            ByteBuffer messageBuffer = ByteBuffer.allocate(messageSize);
+            if (logChannel.read(messageBuffer) < messageSize) {
+                return null;
+            }
+            messageBuffer.flip();
+
+            byte[] message = new byte[messageSize];
+            messageBuffer.get(message);
+            return message;
         }
     }
 
@@ -475,6 +481,26 @@ public class Partition {
                 return false;
             }
 
+            // Remove every segment that starts at or after the diverged offset, before
+            // anything else is touched. A segment that cannot be removed has to abort
+            // the whole truncation: dropping it from the list while its file survives
+            // would leave `segments` describing a log that is not the one on disk, and
+            // its ordering is exactly what findSegmentForOffset's binary search relies
+            // on - an unsorted list makes valid offsets unreadable.
+            int targetIndex = segments.indexOf(target);
+            for (int i = segments.size() - 1; i > targetIndex; i--) {
+                SegmentInfo doomed = segments.get(i);
+                boolean logGone = new File(doomed.getLogPath()).delete();
+                boolean indexGone = new File(doomed.getIndexPath()).delete();
+                if (!logGone || !indexGone) {
+                    LOGGER.warning("Could not remove segment " + doomed.getBaseOffset() +
+                            " of partition " + id + "; abandoning the truncation");
+                    recoverState();
+                    return false;
+                }
+                segments.remove(i);
+            }
+
             // Release the active segment before modifying its files on disk.
             if (activeLogChannel != null) {
                 activeLogChannel.close();
@@ -483,15 +509,6 @@ public class Partition {
             if (activeLogFile != null) {
                 activeLogFile.close();
                 activeLogFile = null;
-            }
-
-            // Remove every segment that starts at or after the diverged offset.
-            int targetIndex = segments.indexOf(target);
-            for (int i = segments.size() - 1; i > targetIndex; i--) {
-                SegmentInfo segment = segments.get(i);
-                new File(segment.getLogPath()).delete();
-                new File(segment.getIndexPath()).delete();
-                segments.remove(i);
             }
 
             // Cut the surviving segment right where the divergence starts.
@@ -511,7 +528,60 @@ public class Partition {
             return true;
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to truncate partition " + id + " at offset " + offset, e);
+            // The files and the in-memory view may now disagree, and the active channel
+            // is gone. Rebuild the view from what is actually on disk rather than
+            // leaving the partition unable to append at all.
+            recoverState();
             return false;
+        }
+    }
+
+    /**
+     * Rebuild the in-memory view from what is actually on disk: forget segments whose
+     * files are gone, restore the ordering, and take the log end offset from the last
+     * survivor.
+     *
+     * <p>Used after a truncation fails partway. Cutting a log back is a prefix
+     * operation, so there is never a half-written record to reason about, and deriving
+     * the offset from the data is what a restart would do anyway - which is why this
+     * is cheaper and no less correct than journalling the truncation.
+     */
+    private void recoverState() {
+        try {
+            for (int i = segments.size() - 1; i >= 0; i--) {
+                if (!new File(segments.get(i).getLogPath()).exists()) {
+                    segments.remove(i);
+                }
+            }
+            segments.sort(Comparator.comparingLong(SegmentInfo::getBaseOffset));
+
+            if (segments.isEmpty()) {
+                nextOffset.set(0);
+                createNewSegment(0);
+                return;
+            }
+
+            SegmentInfo last = segments.get(segments.size() - 1);
+            long messages = countMessagesInSegment(last);
+            nextOffset.set(last.getBaseOffset() + messages);
+
+            // The index may still hold entries for records that are gone, and the reader
+            // addresses it by entry position - one entry per offset, in order. Cut it
+            // back to what the log actually holds or every later lookup is off by one.
+            //
+            // Best effort on purpose: reopening the log is what makes the partition
+            // usable again, and it must not depend on this. A trail of extra entries
+            // past the log end is unreachable anyway, because reads at or beyond the log
+            // end offset are refused before the index is consulted.
+            try (RandomAccessFile indexFile = new RandomAccessFile(last.getIndexPath(), "rw")) {
+                indexFile.setLength(messages * 16);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Could not trim the index of partition " + id, e);
+            }
+
+            openSegmentForAppend(last);
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Failed to recover partition " + id + " after a failed truncation", e);
         }
     }
     
