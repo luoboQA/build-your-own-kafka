@@ -101,18 +101,14 @@ public class SimpleKafkaBroker {
                 brokerChannel.connect(new InetSocketAddress(broker.getHost(), broker.getPort()));
 
                 // Prepare notification
-                ByteBuffer request = ByteBuffer.allocate(3 + topic.length());
-                request.put(Protocol.TOPIC_NOTIFICATION);
-                request.putShort((short) topic.length());
-                request.put(topic.getBytes());
-                request.flip();
+                ByteBuffer request = Protocol.encodeTopicNotification(topic);
 
                 // Send notification
-                brokerChannel.write(request);
+                Protocol.writeFully(brokerChannel, request);
 
                 // Read acknowledgment
                 ByteBuffer response = ByteBuffer.allocate(1);
-                brokerChannel.read(response);
+                Protocol.readFully(brokerChannel, response, Protocol.DEFAULT_IO_TIMEOUT_MS);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to notify broker " + brokerId + " about topic creation", e);
             }
@@ -1088,16 +1084,8 @@ public class SimpleKafkaBroker {
         try (SocketChannel leaderChannel = SocketChannel.open()) {
             connect(leaderChannel, leader, REPLICATION_TIMEOUT_MS);
 
-            // Prepare forwarded produce request
-            // Header: 1 (type) + 2 (topic length) + 4 (partition) + 4 (message length) = 11
-            ByteBuffer request = ByteBuffer.allocate(11 + topic.length() + message.length);
-            request.put(Protocol.PRODUCE);
-            request.putShort((short) topic.length());
-            request.put(topic.getBytes());
-            request.putInt(partition);
-            request.putInt(message.length);
-            request.put(message);
-            request.flip();
+            // A forwarded produce is byte for byte the request the client would have sent.
+            ByteBuffer request = Protocol.encodeProduceRequest(topic, partition, message);
 
             // Send request to leader
             Protocol.writeFully(leaderChannel, request);
@@ -1262,16 +1250,7 @@ public class SimpleKafkaBroker {
         try (SocketChannel followerChannel = SocketChannel.open()) {
             connect(followerChannel, follower, REPLICATION_TIMEOUT_MS);
 
-            // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
-            ByteBuffer request = ByteBuffer.allocate(19 + topic.length() + message.length);
-            request.put(Protocol.REPLICATE);
-            request.putShort((short) topic.length());
-            request.put(topic.getBytes());
-            request.putInt(partitionId);
-            request.putLong(offset);
-            request.putInt(message.length);
-            request.put(message);
-            request.flip();
+            ByteBuffer request = Protocol.encodeReplicateRequest(topic, partitionId, offset, message);
 
             Protocol.writeFully(followerChannel, request);
 
@@ -1483,9 +1462,10 @@ public class SimpleKafkaBroker {
         // Prepare response with metadata
         int size = 5; // 1 byte for response type, 4 bytes for topic count
 
-        // Calculate size for topics metadata
+        // Calculate size for topics metadata. Names are measured in their encoded
+        // bytes, not in chars: the two agree only for ASCII.
         for (Map.Entry<String, List<Partition>> entry : topics.entrySet()) {
-            size += 6 + entry.getKey().length(); // 2 bytes for length, string, 4 bytes for partition count
+            size += 6 + Protocol.utf8(entry.getKey()).length; // 2 bytes for length, name, 4 bytes for partition count
 
             // Add size for each partition
             size += entry.getValue().size() * 12; // 4 bytes for id, 4 bytes for leader, 4 bytes for follower count
@@ -1500,9 +1480,9 @@ public class SimpleKafkaBroker {
         size += 4; // 4 bytes for broker count
         size += clusterMetadata.size() * 10; // 4 bytes for id, 2 bytes for host length, 4 bytes for port
 
-        // Add estimated size for broker hostnames
+        // Add size for broker hostnames
         for (BrokerInfo broker : clusterMetadata.values()) {
-            size += broker.getHost().length();
+            size += Protocol.utf8(broker.getHost()).length;
         }
 
         ByteBuffer response = ByteBuffer.allocate(size);
@@ -1511,9 +1491,10 @@ public class SimpleKafkaBroker {
         // Add broker metadata
         response.putInt(clusterMetadata.size());
         for (BrokerInfo broker : clusterMetadata.values()) {
+            byte[] host = Protocol.utf8(broker.getHost());
             response.putInt(broker.getId());
-            response.putShort((short) broker.getHost().length());
-            response.put(broker.getHost().getBytes());
+            response.putShort((short) host.length);
+            response.put(host);
             response.putInt(broker.getPort());
         }
 
@@ -1523,8 +1504,9 @@ public class SimpleKafkaBroker {
             String topic = entry.getKey();
             List<Partition> partitions = entry.getValue();
 
-            response.putShort((short) topic.length());
-            response.put(topic.getBytes());
+            byte[] topicBytes = Protocol.utf8(topic);
+            response.putShort((short) topicBytes.length);
+            response.put(topicBytes);
             response.putInt(partitions.size());
 
             for (Partition partition : partitions) {
@@ -1581,7 +1563,7 @@ public class SimpleKafkaBroker {
             response.put(Protocol.CREATE_TOPIC_RESPONSE);
             response.put((byte) 0); // 0 = success
             response.flip();
-            clientChannel.write(response);
+            Protocol.writeFully(clientChannel, response);
         } else {
             // Forward to controller
             forwardCreateTopicToController(clientChannel, topic, numPartitions, replicationFactor);
@@ -1619,25 +1601,19 @@ public class SimpleKafkaBroker {
         try (SocketChannel controllerChannel = SocketChannel.open()) {
             controllerChannel.connect(new InetSocketAddress(controller.getHost(), controller.getPort()));
 
-            // Prepare forwarded create topic request
-            ByteBuffer request = ByteBuffer.allocate(9 + topic.length());
-            request.put(Protocol.CREATE_TOPIC);
-            request.putShort((short) topic.length());
-            request.put(topic.getBytes());
-            request.putInt(numPartitions);
-            request.putShort(replicationFactor);
-            request.flip();
+            // A forwarded create-topic is byte for byte the request the client sent.
+            ByteBuffer request = Protocol.encodeCreateTopicRequest(topic, numPartitions, replicationFactor);
 
             // Send request to controller
-            controllerChannel.write(request);
+            Protocol.writeFully(controllerChannel, request);
 
             // Read response from controller
             ByteBuffer response = ByteBuffer.allocate(2);
-            controllerChannel.read(response);
+            Protocol.readFully(controllerChannel, response, Protocol.DEFAULT_IO_TIMEOUT_MS);
             response.flip();
 
             // Forward controller's response back to client
-            clientChannel.write(response);
+            Protocol.writeFully(clientChannel, response);
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to forward create topic request to controller", e);
             Protocol.sendErrorResponse(clientChannel, "Failed to forward to controller");

@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -58,7 +59,7 @@ public class SimpleKafkaClient {
             
             // Request metadata
             ByteBuffer request = Protocol.encodeMetadataRequest();
-            channel.write(request);
+            Protocol.writeFully(channel, request);
             
             // Read response
             ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
@@ -122,7 +123,7 @@ public class SimpleKafkaClient {
             
             // Send create topic request
             ByteBuffer request = Protocol.encodeCreateTopicRequest(topic, numPartitions, replicationFactor);
-            channel.write(request);
+            Protocol.writeFully(channel, request);
             
             // Read response
             ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
@@ -136,10 +137,9 @@ public class SimpleKafkaClient {
             byte responseType = response.get();
             if (responseType != Protocol.CREATE_TOPIC_RESPONSE) {
                 if (responseType == Protocol.ERROR_RESPONSE) {
-                    short errorLength = response.getShort();
-                    byte[] errorBytes = new byte[errorLength];
+                    byte[] errorBytes = new byte[response.getShort() & 0xFFFF];
                     response.get(errorBytes);
-                    String error = new String(errorBytes);
+                    String error = new String(errorBytes, StandardCharsets.UTF_8);
                     LOGGER.warning("Error creating topic: " + error);
                     return false;
                 }

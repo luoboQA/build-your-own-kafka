@@ -3,6 +3,7 @@ package com.simplekafka.broker;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -55,25 +56,54 @@ public class Protocol {
     public static final int MAX_FETCH_RECORD_BYTES = 16 * 1024 * 1024;
     
     /**
+     * The UTF-8 bytes of a string.
+     *
+     * <p>Every length on this wire counts <em>bytes</em>, and so does every buffer
+     * size. {@code String.length()} counts UTF-16 code units, which agree with the
+     * byte count only for ASCII - a topic called "café" is four chars but five
+     * bytes, and sizing a buffer or writing a length prefix from the char count
+     * would overflow the buffer and describe the wrong span to the reader.
+     */
+    public static byte[] utf8(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Read a 2-byte length field as the unsigned value the wire defines it to be.
+     * {@code getShort()} sign-extends, so any length of 32768 or more would arrive
+     * as a negative number and be handed straight to an array allocation.
+     */
+    private static int unsignedShort(ByteBuffer buffer) {
+        return buffer.getShort() & 0xFFFF;
+    }
+
+    /**
      * Send an error response to the client
      */
     public static void sendErrorResponse(SocketChannel channel, String errorMessage) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(3 + errorMessage.length());
+        byte[] text = utf8(errorMessage);
+        // The length field is 2 bytes, so the message has to fit in one.
+        if (text.length > 0xFFFF) {
+            text = java.util.Arrays.copyOf(text, 0xFFFF);
+        }
+
+        ByteBuffer buffer = ByteBuffer.allocate(3 + text.length);
         buffer.put(ERROR_RESPONSE);
-        buffer.putShort((short) errorMessage.length());
-        buffer.put(errorMessage.getBytes());
+        buffer.putShort((short) text.length);
+        buffer.put(text);
         buffer.flip();
         writeFully(channel, buffer);
     }
-    
+
     /**
      * Encode a producer request
      */
     public static ByteBuffer encodeProduceRequest(String topic, int partition, byte[] message) {
-        ByteBuffer buffer = ByteBuffer.allocate(11 + topic.length() + message.length);
+        byte[] topicBytes = utf8(topic);
+        ByteBuffer buffer = ByteBuffer.allocate(11 + topicBytes.length + message.length);
         buffer.put(PRODUCE);
-        buffer.putShort((short) topic.length());
-        buffer.put(topic.getBytes());
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
         buffer.putInt(partition);
         buffer.putInt(message.length);
         buffer.put(message);
@@ -85,10 +115,11 @@ public class Protocol {
      * Encode a fetch request
      */
     public static ByteBuffer encodeFetchRequest(String topic, int partition, long offset, int maxBytes) {
-        ByteBuffer buffer = ByteBuffer.allocate(19 + topic.length());
+        byte[] topicBytes = utf8(topic);
+        ByteBuffer buffer = ByteBuffer.allocate(19 + topicBytes.length);
         buffer.put(FETCH);
-        buffer.putShort((short) topic.length());
-        buffer.put(topic.getBytes());
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
         buffer.putInt(partition);
         buffer.putLong(offset);
         buffer.putInt(maxBytes);
@@ -110,10 +141,11 @@ public class Protocol {
      * Encode a create topic request
      */
     public static ByteBuffer encodeCreateTopicRequest(String topic, int numPartitions, short replicationFactor) {
-        ByteBuffer buffer = ByteBuffer.allocate(9 + topic.length());
+        byte[] topicBytes = utf8(topic);
+        ByteBuffer buffer = ByteBuffer.allocate(9 + topicBytes.length);
         buffer.put(CREATE_TOPIC);
-        buffer.putShort((short) topic.length());
-        buffer.put(topic.getBytes());
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
         buffer.putInt(numPartitions);
         buffer.putShort(replicationFactor);
         buffer.flip();
@@ -128,10 +160,11 @@ public class Protocol {
      */
     public static ByteBuffer encodeReplicateRequest(String topic, int partition, long offset, byte[] message) {
         // Header: 1 (type) + 2 (topic length) + 4 (partition) + 8 (offset) + 4 (message length) = 19
-        ByteBuffer buffer = ByteBuffer.allocate(19 + topic.length() + message.length);
+        byte[] topicBytes = utf8(topic);
+        ByteBuffer buffer = ByteBuffer.allocate(19 + topicBytes.length + message.length);
         buffer.put(REPLICATE);
-        buffer.putShort((short) topic.length());
-        buffer.put(topic.getBytes());
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
         buffer.putInt(partition);
         buffer.putLong(offset);
         buffer.putInt(message.length);
@@ -144,10 +177,11 @@ public class Protocol {
      * Encode a topic notification
      */
     public static ByteBuffer encodeTopicNotification(String topic) {
-        ByteBuffer buffer = ByteBuffer.allocate(3 + topic.length());
+        byte[] topicBytes = utf8(topic);
+        ByteBuffer buffer = ByteBuffer.allocate(3 + topicBytes.length);
         buffer.put(TOPIC_NOTIFICATION);
-        buffer.putShort((short) topic.length());
-        buffer.put(topic.getBytes());
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
         buffer.flip();
         return buffer;
     }
@@ -191,7 +225,7 @@ public class Protocol {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while reading from channel", e);
         } finally {
-            channel.configureBlocking(wasBlocking);
+            restoreBlockingMode(channel, wasBlocking);
         }
     }
 
@@ -199,21 +233,53 @@ public class Protocol {
      * Write the whole buffer, looping over partial writes
      */
     public static void writeFully(SocketChannel channel, ByteBuffer buffer) throws IOException {
-        long deadline = System.currentTimeMillis() + DEFAULT_IO_TIMEOUT_MS;
-        while (buffer.hasRemaining()) {
-            int written = channel.write(buffer);
-            if (written == 0) {
-                // Nothing could be handed to the socket: back off instead of spinning.
-                if (System.currentTimeMillis() > deadline) {
-                    throw new IOException("Timed out writing " + buffer.remaining() + " bytes");
-                }
-                try {
+        writeFully(channel, buffer, DEFAULT_IO_TIMEOUT_MS);
+    }
+
+    /**
+     * Write the whole buffer within a deadline.
+     *
+     * <p>The channel is switched to non-blocking for the duration, for the same
+     * reason {@link #readFully} does it: on a blocking channel {@code write} does not
+     * return 0 when the socket buffer fills, it blocks inside the socket - so the
+     * deadline below would never be consulted and a peer that stopped reading would
+     * hang this thread for as long as the operating system allowed.
+     */
+    public static void writeFully(SocketChannel channel, ByteBuffer buffer, long timeoutMillis)
+            throws IOException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        boolean wasBlocking = channel.isBlocking();
+        channel.configureBlocking(false);
+        try {
+            while (buffer.hasRemaining()) {
+                int written = channel.write(buffer);
+                if (written == 0) {
+                    // Nothing could be handed to the socket: back off instead of spinning.
+                    if (System.currentTimeMillis() > deadline) {
+                        throw new IOException("Timed out writing " + buffer.remaining() + " bytes");
+                    }
                     Thread.sleep(2);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while writing to channel", e);
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while writing to channel", e);
+        } finally {
+            restoreBlockingMode(channel, wasBlocking);
+        }
+    }
+
+    /**
+     * Put the channel back the way it was found.
+     *
+     * <p>A channel that has already been closed cannot be reconfigured, and that
+     * failure must not replace the error that caused the close.
+     */
+    private static void restoreBlockingMode(SocketChannel channel, boolean wasBlocking) {
+        try {
+            channel.configureBlocking(wasBlocking);
+        } catch (IOException ignored) {
+            // The channel is gone; the caller is already unwinding a failure.
         }
     }
     
@@ -327,7 +393,7 @@ public class Protocol {
         text.flip();
         byte[] bytes = new byte[errorLength];
         text.get(bytes);
-        return new String(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     /**
@@ -337,11 +403,9 @@ public class Protocol {
         byte responseType = buffer.get();
         if (responseType != PRODUCE_RESPONSE) {
             if (responseType == ERROR_RESPONSE) {
-                short errorLength = buffer.getShort();
-                byte[] errorBytes = new byte[errorLength];
+                byte[] errorBytes = new byte[unsignedShort(buffer)];
                 buffer.get(errorBytes);
-                String error = new String(errorBytes);
-                return new ProduceResult(-1, error);
+                return new ProduceResult(-1, new String(errorBytes, StandardCharsets.UTF_8));
             }
             return new ProduceResult(-1, "Invalid response type");
         }
@@ -359,11 +423,10 @@ public class Protocol {
         byte responseType = buffer.get();
         if (responseType != METADATA_RESPONSE) {
             if (responseType == ERROR_RESPONSE) {
-                short errorLength = buffer.getShort();
-                byte[] errorBytes = new byte[errorLength];
+                byte[] errorBytes = new byte[unsignedShort(buffer)];
                 buffer.get(errorBytes);
-                String error = new String(errorBytes);
-                return new MetadataResult(new ArrayList<>(), new ArrayList<>(), error);
+                return new MetadataResult(new ArrayList<>(), new ArrayList<>(),
+                        new String(errorBytes, StandardCharsets.UTF_8));
             }
             return new MetadataResult(new ArrayList<>(), new ArrayList<>(), "Invalid response type");
         }
@@ -374,10 +437,9 @@ public class Protocol {
         
         for (int i = 0; i < brokerCount; i++) {
             int brokerId = buffer.getInt();
-            short hostLength = buffer.getShort();
-            byte[] hostBytes = new byte[hostLength];
+            byte[] hostBytes = new byte[unsignedShort(buffer)];
             buffer.get(hostBytes);
-            String host = new String(hostBytes);
+            String host = new String(hostBytes, StandardCharsets.UTF_8);
             int port = buffer.getInt();
             
             brokers.add(new BrokerInfo(brokerId, host, port));
@@ -388,10 +450,9 @@ public class Protocol {
         List<TopicMetadata> topics = new ArrayList<>();
         
         for (int i = 0; i < topicCount; i++) {
-            short topicLength = buffer.getShort();
-            byte[] topicBytes = new byte[topicLength];
+            byte[] topicBytes = new byte[unsignedShort(buffer)];
             buffer.get(topicBytes);
-            String topicName = new String(topicBytes);
+            String topicName = new String(topicBytes, StandardCharsets.UTF_8);
             
             int partitionCount = buffer.getInt();
             List<PartitionMetadata> partitions = new ArrayList<>();
