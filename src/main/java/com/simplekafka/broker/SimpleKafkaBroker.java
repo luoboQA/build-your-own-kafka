@@ -190,6 +190,49 @@ public class SimpleKafkaBroker {
     }
 
     /**
+     * The most partitions one create-topic request may ask for. The controller creates a
+     * ZooKeeper node and a Partition object per partition, so an unbounded count is a way
+     * to exhaust a broker from one small request.
+     */
+    static final int MAX_PARTITIONS_PER_TOPIC = 1000;
+
+    /** The most a client may ask for in one fetch, matching the reply's own caps. */
+    static final int MAX_FETCH_BYTES = 16 * 1024 * 1024;
+
+    /** Ceiling on one fetch reply, per-record framing included. */
+    static final int MAX_FETCH_REPLY_BYTES = 32 * 1024 * 1024;
+
+    /**
+     * @return why the configuration is unacceptable, or null when it is fine
+     */
+    static String validateTopicConfig(int numPartitions, short replicationFactor, int knownBrokers) {
+        if (numPartitions <= 0) {
+            return "A topic needs at least one partition";
+        }
+        if (numPartitions > MAX_PARTITIONS_PER_TOPIC) {
+            return "Too many partitions: " + numPartitions +
+                    " (the limit is " + MAX_PARTITIONS_PER_TOPIC + ")";
+        }
+        if (replicationFactor <= 0) {
+            return "Replication factor must be at least 1";
+        }
+        if (replicationFactor > knownBrokers) {
+            return "Replication factor " + replicationFactor +
+                    " exceeds the " + knownBrokers + " brokers in the cluster";
+        }
+        return null;
+    }
+
+    /**
+     * Clamp a client's requested fetch size. The value arrives in a four byte field of an
+     * otherwise bounded request and is handed straight to the reader as a budget, so an
+     * enormous one would pull a whole partition into memory.
+     */
+    static int sanitizeFetchMaxBytes(int maxBytes) {
+        return Math.max(0, Math.min(maxBytes, MAX_FETCH_BYTES));
+    }
+
+    /**
      * Whether this broker stores the log of a partition, i.e. whether it is the
      * leader or one of its followers.
      */
@@ -1381,7 +1424,7 @@ public class SimpleKafkaBroker {
 
         int partition = buffer.getInt();
         long offset = buffer.getLong();
-        int maxBytes = buffer.getInt();
+        int maxBytes = sanitizeFetchMaxBytes(buffer.getInt());
 
         LOGGER.info("Fetch request for topic: " + topic + ", partition: " + partition +
                 ", offset: " + offset + ", maxBytes: " + maxBytes);
@@ -1433,13 +1476,21 @@ public class SimpleKafkaBroker {
         // Read messages from log
         List<byte[]> messages = targetPartition.readMessages(offset, maxBytes);
 
-        // Send response
-        int totalSize = 5; // 1 byte for response type, 4 bytes for message count
+        // Counted in a long: each record carries 12 bytes of framing on top of its
+        // payload, so a reply full of small records is bigger than the byte budget
+        // suggests - and an int total could wrap negative straight into allocate().
+        long totalSize = 5L; // 1 byte for response type, 4 bytes for message count
         for (byte[] msg : messages) {
             totalSize += 12 + msg.length; // 8 bytes for offset, 4 bytes for length, plus message bytes
         }
 
-        ByteBuffer response = ByteBuffer.allocate(totalSize);
+        if (totalSize > MAX_FETCH_REPLY_BYTES) {
+            Protocol.sendErrorResponse(clientChannel,
+                    "Fetch reply of " + totalSize + " bytes exceeds the " + MAX_FETCH_REPLY_BYTES + " byte limit");
+            return;
+        }
+
+        ByteBuffer response = ByteBuffer.allocate((int) totalSize);
         response.put(Protocol.FETCH_RESPONSE);
         response.putInt(messages.size());
 
@@ -1612,9 +1663,9 @@ public class SimpleKafkaBroker {
         }
 
         // Validate parameters
-        if (numPartitions <= 0 || replicationFactor <= 0 ||
-                replicationFactor > clusterMetadata.size()) {
-            Protocol.sendErrorResponse(clientChannel, "Invalid topic configuration");
+        String configProblem = validateTopicConfig(numPartitions, replicationFactor, clusterMetadata.size());
+        if (configProblem != null) {
+            Protocol.sendErrorResponse(clientChannel, configProblem);
             return;
         }
 

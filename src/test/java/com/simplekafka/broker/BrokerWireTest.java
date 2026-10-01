@@ -1,6 +1,9 @@
 package com.simplekafka.broker;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -175,6 +178,54 @@ class BrokerWireTest {
 
         assertEquals(List.of("one", "two"), messagesIn(topic, 0),
                 "each pipelined produce must store its own message, in the order it was sent");
+    }
+
+    /**
+     * The controller creates a ZooKeeper node and a Partition object per partition, so
+     * a count that is merely positive is not a bound at all: one small request could
+     * have it allocate until the broker dies.
+     */
+    @Test
+    void anAbsurdPartitionCountIsRefusedRatherThanAttempted() throws Exception {
+        String topic = newTopic();
+        // Over the limit, but small enough that the unguarded version would still
+        // finish - so the test measures the refusal, not a timeout.
+        int tooMany = SimpleKafkaBroker.MAX_PARTITIONS_PER_TOPIC + 1000;
+
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.connect(new InetSocketAddress("127.0.0.1", brokerPort));
+            Protocol.writeFully(channel,
+                    Protocol.encodeCreateTopicRequest(topic, tooMany, (short) 1));
+
+            assertEquals(Protocol.ERROR_RESPONSE, readTypeByte(channel),
+                    "a request for " + tooMany + " partitions must be refused");
+        }
+
+        assertFalse(new File("data/" + BROKER_ID + "/" + topic).exists(),
+                "a refused topic must not leave anything behind");
+    }
+
+    @Test
+    void topicConfigurationIsChecked() {
+        assertNull(SimpleKafkaBroker.validateTopicConfig(3, (short) 2, 3));
+
+        assertNotNull(SimpleKafkaBroker.validateTopicConfig(0, (short) 1, 3));
+        assertNotNull(SimpleKafkaBroker.validateTopicConfig(-1, (short) 1, 3));
+        assertNotNull(SimpleKafkaBroker.validateTopicConfig(
+                SimpleKafkaBroker.MAX_PARTITIONS_PER_TOPIC + 1, (short) 1, 3));
+        assertNotNull(SimpleKafkaBroker.validateTopicConfig(3, (short) 0, 3));
+        assertNotNull(SimpleKafkaBroker.validateTopicConfig(3, (short) 4, 3),
+                "a replication factor the cluster cannot satisfy must be refused");
+    }
+
+    @Test
+    void aFetchBudgetIsClampedToSomethingAMachineCanHold() {
+        assertEquals(SimpleKafkaBroker.MAX_FETCH_BYTES,
+                SimpleKafkaBroker.sanitizeFetchMaxBytes(Integer.MAX_VALUE));
+        assertEquals(SimpleKafkaBroker.MAX_FETCH_BYTES,
+                SimpleKafkaBroker.sanitizeFetchMaxBytes(SimpleKafkaBroker.MAX_FETCH_BYTES + 1));
+        assertEquals(1024, SimpleKafkaBroker.sanitizeFetchMaxBytes(1024));
+        assertEquals(0, SimpleKafkaBroker.sanitizeFetchMaxBytes(-1));
     }
 
     /**
