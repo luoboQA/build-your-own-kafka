@@ -1752,7 +1752,10 @@ public class SimpleKafkaBroker {
 
         // As controller, create the topic
         if (isController.get()) {
-            createTopic(topic, numPartitions, replicationFactor);
+            if (!createTopic(topic, numPartitions, replicationFactor)) {
+                Protocol.sendErrorResponse(clientChannel, "Failed to create topic " + topic);
+                return;
+            }
 
             // Send success response
             ByteBuffer response = ByteBuffer.allocate(2);
@@ -1817,28 +1820,32 @@ public class SimpleKafkaBroker {
     }
 
     /**
-     * Create a new topic with the specified configuration
+     * Create a new topic with the specified configuration.
+     *
+     * @return whether the topic now exists on this broker
      */
-    private void createTopic(String topic, int numPartitions, short replicationFactor) {
+    private boolean createTopic(String topic, int numPartitions, short replicationFactor) {
         if (!isController.get()) {
             LOGGER.warning("Only the controller can create topics");
-            return;
+            return false;
         }
 
-        try {
-            // Topic/partition directories are created lazily by Partition itself,
-            // and only for the partitions this broker actually replicates.
-            String topicDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
+        // Topic/partition directories are created lazily by Partition itself,
+        // and only for the partitions this broker actually replicates.
+        String topicDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
+        String topicPath = "/topics/" + topic;
 
+        List<Partition> partitions = new ArrayList<>();
+        boolean createdTopicNode = false;
+
+        try {
             // Create topic in ZooKeeper
-            String topicPath = "/topics/" + topic;
             if (!zkClient.exists(topicPath)) {
                 zkClient.createPersistentNode(topicPath, "");
+                createdTopicNode = true;
                 zkClient.createPersistentNode(topicPath + "/partitions", "");
             }
 
-            // Create partitions
-            List<Partition> partitions = new ArrayList<>();
             List<Integer> brokerIds = new ArrayList<>(clusterMetadata.keySet());
 
             for (int i = 0; i < numPartitions; i++) {
@@ -1890,8 +1897,47 @@ public class SimpleKafkaBroker {
                     notifyBrokerForTopicCreation(brokerId, topic);
                 }
             }
+
+            return true;
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to create topic", e);
+            // The client is waiting for an answer, and the one answer it must not get is
+            // "created". Undo what this call managed before it failed: the partitions are
+            // holding open file handles and armed watches, and the ZooKeeper nodes would
+            // make the next broker to load this topic believe in one that was never
+            // finished. WARNING rather than SEVERE because this is a reported outcome -
+            // the client is told - not a broker failure nobody sees.
+            LOGGER.log(Level.WARNING, "Failed to create topic " + topic + "; undoing it", e);
+            for (Partition partition : partitions) {
+                partition.close();
+            }
+            removeTopicNodes(topicPath, createdTopicNode);
+            return false;
+        }
+    }
+
+    /**
+     * Take back the ZooKeeper nodes a failed create-topic left behind: the partitions
+     * this call wrote, and the topic node itself when this call is what created it.
+     */
+    private void removeTopicNodes(String topicPath, boolean createdTopicNode) {
+        try {
+            for (String partitionId : zkClient.getChildren(topicPath + "/partitions")) {
+                deleteNodeQuietly(topicPath + "/partitions/" + partitionId);
+            }
+            if (createdTopicNode) {
+                deleteNodeQuietly(topicPath + "/partitions");
+                deleteNodeQuietly(topicPath);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Could not remove the ZooKeeper nodes of a failed topic creation", e);
+        }
+    }
+
+    private void deleteNodeQuietly(String path) {
+        try {
+            zkClient.deleteNode(path);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Could not remove " + path, e);
         }
     }
 }

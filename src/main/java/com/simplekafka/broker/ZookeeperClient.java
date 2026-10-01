@@ -153,6 +153,25 @@ public class ZookeeperClient implements Watcher {
     }
 
     /**
+     * Delete a node and whatever it holds, if it is there.
+     *
+     * <p>Unlike {@link #deleteEmptyNode} this makes no assumption about the contents or
+     * who owns it: it exists to take back nodes the caller has just written itself, when
+     * the work that was going to justify them failed.
+     *
+     * @return true when this call removed the node
+     */
+    public boolean deleteNode(String path) throws KeeperException, InterruptedException {
+        try {
+            zooKeeper.delete(path, -1);
+            LOGGER.info("Deleted node: " + path);
+            return true;
+        } catch (KeeperException.NoNodeException e) {
+            return false;
+        }
+    }
+
+    /**
      * Read a node's data, or null when the node is not there (any more).
      *
      * <p>Used where a missing node is an expected state - the controller can vanish
