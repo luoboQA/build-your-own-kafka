@@ -2,10 +2,13 @@ package com.simplekafka.client;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import com.simplekafka.broker.Protocol;
 
 /**
  * Example consumer for Build Your Own Kafka
@@ -72,11 +75,28 @@ public class SimpleKafkaConsumer {
      * Poll for new messages (single poll)
      */
     public List<byte[]> poll() throws IOException {
-        List<byte[]> messages = client.fetch(topic, partition, currentOffset, MAX_BYTES);
-        if (!messages.isEmpty()) {
-            currentOffset += messages.size();
+        List<byte[]> messages = new ArrayList<>();
+        for (Protocol.Record record : pollRecords()) {
+            messages.add(record.getPayload());
         }
         return messages;
+    }
+
+    /**
+     * Poll, keeping each record's own offset.
+     *
+     * <p>The next offset comes from the records rather than from how many there are. A
+     * reader can start earlier than the offset it asked for - the partition's index can
+     * fall back to an earlier point - and counting forwards from the request would then
+     * leave the cursor past messages that were never handed over: they would be skipped,
+     * silently, and the count would still look right.
+     */
+    private List<Protocol.Record> pollRecords() throws IOException {
+        List<Protocol.Record> records = client.fetchRecords(topic, partition, currentOffset, MAX_BYTES);
+        if (!records.isEmpty()) {
+            currentOffset = records.get(records.size() - 1).getOffset() + 1;
+        }
+        return records;
     }
     
     /**
@@ -87,14 +107,18 @@ public class SimpleKafkaConsumer {
             consumerThread = new Thread(() -> {
                 try {
                     while (running.get()) {
-                        List<byte[]> messages = poll();
-                        
-                        for (byte[] message : messages) {
-                            handler.handle(message, currentOffset - messages.size() + messages.indexOf(message));
+                        List<Protocol.Record> records = pollRecords();
+
+                        // Each record is handed over with the offset it occupies, taken
+                        // from the record itself. Working it out from the position in the
+                        // batch was both wrong when the broker started earlier and
+                        // quadratic, since List.indexOf compares by reference.
+                        for (Protocol.Record record : records) {
+                            handler.handle(record.getPayload(), record.getOffset());
                         }
-                        
+
                         // If no messages, wait a bit before polling again
-                        if (messages.isEmpty()) {
+                        if (records.isEmpty()) {
                             Thread.sleep(POLL_INTERVAL_MS);
                         }
                     }

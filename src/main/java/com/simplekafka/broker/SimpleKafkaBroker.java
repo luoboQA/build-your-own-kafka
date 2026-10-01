@@ -1297,10 +1297,20 @@ public class SimpleKafkaBroker {
             if (followerId == brokerId)
                 continue; // Skip self
 
+            // The follower is very likely alive even when this broker has not heard of it:
+            // it arrives through the /brokers watch, which can lag the assignment that
+            // names it. Ask ZooKeeper before giving up, because skipping a live replica
+            // silently turns acks=all into acks=1 - the produce is acknowledged and the
+            // client is told the write is durable, while that replica has nothing.
+            ensureKnown(followerId);
+
             BrokerInfo follower = clusterMetadata.get(followerId);
             if (follower == null) {
+                // Genuinely gone: its /brokers node was ephemeral and the session ending
+                // is what removed it, so it is not a replica that could be in sync.
                 LOGGER.warning("Cannot replicate partition " + partitionId + " of topic " +
-                        topic + ": follower broker " + followerId + " is not known to this broker");
+                        topic + ": follower broker " + followerId +
+                        " is not known to this broker and is not registered in ZooKeeper");
                 continue;
             }
 
@@ -1389,24 +1399,30 @@ public class SimpleKafkaBroker {
 
         long cursor = fromOffset;
         while (cursor <= toOffset) {
-            List<byte[]> batch = partition.readMessages(cursor, 64 * 1024);
+            List<Protocol.Record> batch = partition.readMessages(cursor, 64 * 1024);
             if (batch.isEmpty()) {
                 LOGGER.severe("Cannot catch up broker " + follower.getId() + ": leader has no data at offset " + cursor);
                 return false;
             }
 
-            for (byte[] pending : batch) {
-                if (cursor > toOffset) {
+            for (Protocol.Record record : batch) {
+                // Re-send at the offset the record occupies, which is not necessarily
+                // where the read was asked to start: the reader may have fallen back to
+                // an earlier point in its index, and the follower would then be handed
+                // the wrong payload for the offset it is told.
+                if (record.getOffset() > toOffset) {
+                    cursor = record.getOffset(); // past the target, so the loop ends
                     break;
                 }
 
-                ReplicationAck ack = sendReplicateRequest(topic, partitionId, follower, cursor, pending);
+                ReplicationAck ack = sendReplicateRequest(topic, partitionId, follower,
+                        record.getOffset(), record.getPayload());
                 if (ack.status != Protocol.REPLICATE_ACK) {
                     LOGGER.severe("Catch-up of broker " + follower.getId() + " for " + topic + "/" +
-                            partitionId + " stopped at offset " + cursor + " with status " + ack.status);
+                            partitionId + " stopped at offset " + record.getOffset() + " with status " + ack.status);
                     return false;
                 }
-                cursor++;
+                cursor = record.getOffset() + 1;
             }
         }
 
@@ -1603,15 +1619,15 @@ public class SimpleKafkaBroker {
             return;
         }
 
-        // Read messages from log
-        List<byte[]> messages = targetPartition.readMessages(offset, maxBytes);
+        // Read messages from log, each carrying the offset it actually occupies
+        List<Protocol.Record> records = targetPartition.readMessages(offset, maxBytes);
 
         // Counted in a long: each record carries 12 bytes of framing on top of its
         // payload, so a reply full of small records is bigger than the byte budget
         // suggests - and an int total could wrap negative straight into allocate().
         long totalSize = 5L; // 1 byte for response type, 4 bytes for message count
-        for (byte[] msg : messages) {
-            totalSize += 12 + msg.length; // 8 bytes for offset, 4 bytes for length, plus message bytes
+        for (Protocol.Record record : records) {
+            totalSize += 12 + record.getPayload().length; // 8 for offset, 4 for length, plus bytes
         }
 
         if (totalSize > MAX_FETCH_REPLY_BYTES) {
@@ -1622,14 +1638,16 @@ public class SimpleKafkaBroker {
 
         ByteBuffer response = ByteBuffer.allocate((int) totalSize);
         response.put(Protocol.FETCH_RESPONSE);
-        response.putInt(messages.size());
+        response.putInt(records.size());
 
-        long currentOffset = offset;
-        for (byte[] msg : messages) {
-            response.putLong(currentOffset);
-            response.putInt(msg.length);
-            response.put(msg);
-            currentOffset++;
+        // The offsets come from the records, not from counting forwards from the one that
+        // was asked for: a reader that had to start earlier than that would otherwise
+        // send every record out under an offset it does not occupy.
+        for (Protocol.Record record : records) {
+            byte[] payload = record.getPayload();
+            response.putLong(record.getOffset());
+            response.putInt(payload.length);
+            response.put(payload);
         }
 
         response.flip();

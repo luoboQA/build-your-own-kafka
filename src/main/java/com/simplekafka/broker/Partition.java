@@ -618,10 +618,10 @@ public class Partition {
     /**
      * Read messages from the log starting at offset
      */
-    public List<byte[]> readMessages(long offset, int maxBytes) {
-        List<byte[]> messages = new ArrayList<>();
+    public List<Protocol.Record> readMessages(long offset, int maxBytes) {
+        List<Protocol.Record> records = new ArrayList<>();
         if (!localReplica) {
-            return messages;
+            return records;
         }
 
         lock.readLock().lock();
@@ -631,14 +631,18 @@ public class Partition {
             // Find the segment containing the offset
             SegmentInfo targetSegment = findSegmentForOffset(offset);
             if (targetSegment == null) {
-                return messages;
+                return records;
             }
             
             // Find the file position for the offset using the index
-            long position = findPositionForOffset(targetSegment, offset);
-            if (position < 0) {
-                return messages;
+            IndexEntry entry = findPositionForOffset(targetSegment, offset);
+            if (entry == null) {
+                return records;
             }
+
+            // The index can hand back an earlier offset than the one asked for, so the
+            // cursor starts wherever the entry actually points rather than at the request.
+            long position = entry.position;
             
             // Open the log file for reading. The handle is swapped for the next segment
             // when the read runs past the end of this one, so it is managed explicitly.
@@ -651,7 +655,7 @@ public class Partition {
                 
                 // Read messages until maxBytes is reached
                 ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
-                long currentOffset = offset;
+                long currentOffset = entry.offset;
                 
                 while (bytesRead < maxBytes && logChannel.position() < logChannel.size()) {
                     // Read message size
@@ -689,10 +693,10 @@ public class Partition {
                     
                     messageBuffer.flip();
                     
-                    // Add message to result
+                    // Add message to result, with the offset it really occupies
                     byte[] message = new byte[messageSize];
                     messageBuffer.get(message);
-                    messages.add(message);
+                    records.add(new Protocol.Record(currentOffset, message));
                     
                     // Update bytes read
                     bytesRead += messageSize + 4; // message size + 4 bytes for size field
@@ -710,6 +714,10 @@ public class Partition {
                             logChannel = logFile.getChannel();
                             position = 0;
                             logChannel.position(position);
+                            // A segment is named after the offset its first message
+                            // occupies, so the cursor belongs there rather than where the
+                            // previous segment happened to run out.
+                            currentOffset = targetSegment.getBaseOffset();
                         }
                     }
                 }
@@ -721,8 +729,8 @@ public class Partition {
         } finally {
             lock.readLock().unlock();
         }
-        
-        return messages;
+
+        return records;
     }
     
     /**
@@ -766,15 +774,16 @@ public class Partition {
     /**
      * Find the file position for the given offset using the index
      */
-    private long findPositionForOffset(SegmentInfo segment, long offset) {
+    private IndexEntry findPositionForOffset(SegmentInfo segment, long offset) {
         try (RandomAccessFile indexFile = new RandomAccessFile(segment.getIndexPath(), "r");
              FileChannel indexChannel = indexFile.getChannel()) {
             
             if (indexChannel.size() < 16) {
-                // Not one whole entry: a torn index (or none at all) means start from the
-                // beginning of the log. Reading the last entry would seek to size() - 16,
-                // which for an index of 1..15 bytes is a negative file position.
-                return 0;
+                // Not one whole entry: a torn index, or none at all. Start at the
+                // beginning of the log, which is the offset the segment's name gives.
+                // Reading a last entry would seek to size() - 16, which for an index of
+                // 1..15 bytes is a negative file position.
+                return new IndexEntry(segment.getBaseOffset(), 0);
             }
             
             // Relative offset within the segment
@@ -783,32 +792,36 @@ public class Partition {
             // Each index entry is 16 bytes (8 for offset, 8 for position)
             long entryCount = indexChannel.size() / 16;
             
-            if (relativeOffset >= entryCount) {
-                // Not found in index, use the last known position
-                indexChannel.position(indexChannel.size() - 16);
-                ByteBuffer buffer = ByteBuffer.allocate(16);
-                indexChannel.read(buffer);
-                buffer.flip();
-                
-                // Skip offset
-                buffer.getLong();
-                // Return position
-                return buffer.getLong();
-            }
-            
-            // Read the specific index entry
-            indexChannel.position(relativeOffset * 16);
+            // Past the end of the index the last entry is the closest known point, and
+            // the reader walks forward from there. That is an EARLIER offset than the one
+            // asked for, which is exactly why the entry's own offset goes back with its
+            // position: the caller can then describe what it returns truthfully instead
+            // of assuming it starts where it was asked to.
+            long entryIndex = Math.min(Math.max(relativeOffset, 0), entryCount - 1);
+
+            indexChannel.position(entryIndex * 16);
             ByteBuffer buffer = ByteBuffer.allocate(16);
             indexChannel.read(buffer);
             buffer.flip();
-            
-            // Skip offset
-            buffer.getLong();
-            // Return position
-            return buffer.getLong();
+
+            return new IndexEntry(buffer.getLong(), buffer.getLong());
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to find position for offset " + offset, e);
-            return -1;
+            return null;
+        }
+    }
+
+    /**
+     * What an index lookup found: a byte position, and the offset that position actually
+     * holds. The two differ whenever the lookup fell back to the last entry it had.
+     */
+    private static final class IndexEntry {
+        private final long offset;
+        private final long position;
+
+        private IndexEntry(long offset, long position) {
+            this.offset = offset;
+            this.position = position;
         }
     }
     

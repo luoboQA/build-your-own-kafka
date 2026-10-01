@@ -11,10 +11,12 @@ import java.io.File;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -41,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import com.simplekafka.client.SimpleKafkaClient;
+import com.simplekafka.client.SimpleKafkaConsumer;
 
 /**
  * What a single client connection may put on the wire.
@@ -323,6 +326,42 @@ class BrokerWireTest {
         } finally {
             capture.detach();
         }
+    }
+
+    /**
+     * The offset a consumer's cursor ends up on has to follow the records it was given,
+     * not how many of them there were.
+     *
+     * <p>A read can start earlier than the offset it asked for - the partition's index
+     * falls back to the last entry it has - so the replies carry records the consumer did
+     * not ask for. Counting forwards from the request would put the cursor past messages
+     * that were handed over anyway, and they would simply be skipped the next time round,
+     * with no error anywhere.
+     */
+    @Test
+    void aConsumerDoesNotSkipMessagesWhenTheReaderStartsBeforeTheOffsetItAskedFor() throws Exception {
+        String topic = newTopic();
+        createTopic(topic);
+        for (int i = 0; i < 3; i++) {
+            client.send(topic, 0, bytes("m" + i));
+        }
+
+        // Cut the index down to its first entry, so a read at offset 2 has to fall back
+        // to offset 0 and walk forward.
+        Path index = Path.of("data/" + BROKER_ID + "/" + topic + "/0/00000000000000000000.index");
+        try (FileChannel channel = FileChannel.open(index, StandardOpenOption.WRITE)) {
+            channel.truncate(16);
+        }
+
+        SimpleKafkaConsumer consumer =
+                new SimpleKafkaConsumer("127.0.0.1", brokerPort, topic, 0, 2);
+        consumer.initialize();
+
+        List<byte[]> messages = consumer.poll();
+
+        assertEquals(3, messages.size(), "the reader falls back to offset 0, so all three come back");
+        assertEquals(3, consumer.getCurrentOffset(),
+                "the cursor must follow the last record's offset, not the size of the batch");
     }
 
     private static ZooKeeper connectAsTestClient() throws Exception {

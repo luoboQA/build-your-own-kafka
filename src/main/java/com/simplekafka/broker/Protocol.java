@@ -342,7 +342,7 @@ public class Protocol {
         byte responseType = type.get();
 
         if (responseType == ERROR_RESPONSE) {
-            return new FetchResult(new byte[0][], readErrorText(channel, timeoutMillis));
+            return new FetchResult(new long[0], new byte[0][], readErrorText(channel, timeoutMillis));
         }
         if (responseType != FETCH_RESPONSE) {
             throw new IOException("Unexpected fetch response type: " + responseType);
@@ -356,12 +356,17 @@ public class Protocol {
             throw new IOException("Implausible fetch response with " + messageCount + " records");
         }
 
+        long[] offsets = new long[messageCount];
         byte[][] messages = new byte[messageCount][];
         for (int i = 0; i < messageCount; i++) {
             ByteBuffer header = ByteBuffer.allocate(12); // offset + record length
             readFully(channel, header, timeoutMillis);
             header.flip();
-            header.getLong(); // the caller passed its own offset; it does not need it back
+            // The offset is kept rather than assumed. A reader that could not start
+            // exactly where it was asked to - the index fallback allows that - would
+            // otherwise have its records silently labelled with offsets they do not
+            // occupy, and nothing downstream could tell.
+            offsets[i] = header.getLong();
             int size = header.getInt();
             if (size < 0 || size > MAX_FETCH_RECORD_BYTES) {
                 throw new IOException("Implausible record size: " + size);
@@ -374,7 +379,7 @@ public class Protocol {
             payload.get(messages[i]);
         }
 
-        return new FetchResult(messages, null);
+        return new FetchResult(offsets, messages, null);
     }
 
     /**
@@ -506,14 +511,24 @@ public class Protocol {
      * Result class for fetch operations
      */
     public static class FetchResult {
+        private final long[] offsets;
         private final byte[][] messages;
         private final String error;
-        
-        public FetchResult(byte[][] messages, String error) {
+
+        public FetchResult(long[] offsets, byte[][] messages, String error) {
+            this.offsets = offsets;
             this.messages = messages;
             this.error = error;
         }
-        
+
+        /**
+         * The offset each message occupies, position for position with
+         * {@link #getMessages()}.
+         */
+        public long[] getOffsets() {
+            return offsets;
+        }
+
         public byte[][] getMessages() {
             return messages;
         }
@@ -531,6 +546,31 @@ public class Protocol {
         }
     }
     
+    /**
+     * A message together with the offset it occupies in its partition.
+     *
+     * <p>The two only mean anything together: an offset assumed from the one that was
+     * asked for is wrong the moment a reader starts anywhere else, and nothing
+     * downstream can tell the difference.
+     */
+    public static class Record {
+        private final long offset;
+        private final byte[] payload;
+
+        public Record(long offset, byte[] payload) {
+            this.offset = offset;
+            this.payload = payload;
+        }
+
+        public long getOffset() {
+            return offset;
+        }
+
+        public byte[] getPayload() {
+            return payload;
+        }
+    }
+
     /**
      * Result class for metadata operations
      */

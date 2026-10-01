@@ -420,6 +420,36 @@ class ReplicationOffsetTest {
     // ------------------------------------------------------------------ helpers
 
     /**
+     * A leader that has not heard of a follower yet must not go ahead without it.
+     *
+     * <p>Followers arrive through the /brokers watch, which can lag the assignment that
+     * names them, and the replication path skipped any follower it did not know about.
+     * Skipping is right for one that has gone - acks=all is about the replicas that can
+     * hold the write - but not for one that is simply not in this broker's view yet: the
+     * produce was acknowledged as replicated and the follower's log stayed empty.
+     */
+    @Test
+    void aLeaderReplicatesToAFollowerItHasNotHeardOfYet() throws Exception {
+        String topic = newTopic();
+        createTopic(topic, 1, (short) 2);
+
+        int leader = leaderOf(topic, 0);
+        int follower = other(leader);
+
+        // Put the leader back in the state a lagging /brokers watch leaves it in.
+        brokers.get(leader).forgetBroker(follower);
+
+        assertEquals(0, client.send(topic, 0, bytes("replicated-anyway")),
+                "the produce must be accepted");
+
+        awaitTrue("the acknowledged message to reach the follower", TIMEOUT,
+                () -> readLog(follower, topic, 0).size() == 1);
+
+        assertEquals(readLog(leader, topic, 0), readLog(follower, topic, 0),
+                "a produce that was acknowledged must be on every replica of the partition");
+    }
+
+    /**
      * A client routes by looking a partition's leader up in the broker list it was sent.
      * An assignment arrives through its own watch and can beat the /brokers watch that
      * would describe the broker it names, so a metadata response that names a broker it

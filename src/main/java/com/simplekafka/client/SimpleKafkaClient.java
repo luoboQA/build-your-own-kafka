@@ -220,9 +220,26 @@ public class SimpleKafkaClient {
     }
     
     /**
-     * Consume messages from a topic-partition
+     * Consume messages from a topic-partition, without their offsets.
+     *
+     * <p>Prefer {@link #fetchRecords}: an offset only means something alongside its
+     * bytes, and a caller that assumes the first message is the one it asked for is
+     * wrong whenever the broker had to start earlier than that.
      */
     public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) throws IOException {
+        List<byte[]> messages = new ArrayList<>();
+        for (Protocol.Record record : fetchRecords(topic, partition, offset, maxBytes)) {
+            messages.add(record.getPayload());
+        }
+        return messages;
+    }
+
+    /**
+     * Consume records from a topic-partition, each carrying the offset it occupies -
+     * which is not necessarily the offset that was asked for.
+     */
+    public List<Protocol.Record> fetchRecords(String topic, int partition, long offset, int maxBytes)
+            throws IOException {
         if (!topicMetadata.containsKey(topic)) {
             refreshMetadata();
             if (!topicMetadata.containsKey(topic)) {
@@ -273,13 +290,14 @@ public class SimpleKafkaClient {
             if (!result.isSuccess()) {
                 throw new IOException("Failed to fetch messages: " + result.getError());
             }
-            
-            List<byte[]> messages = new ArrayList<>();
-            for (byte[] msg : result.getMessages()) {
-                messages.add(msg);
+
+            long[] offsets = result.getOffsets();
+            byte[][] messages = result.getMessages();
+            List<Protocol.Record> records = new ArrayList<>();
+            for (int i = 0; i < messages.length; i++) {
+                records.add(new Protocol.Record(offsets[i], messages[i]));
             }
-            
-            return messages;
+            return records;
         }
     }
     

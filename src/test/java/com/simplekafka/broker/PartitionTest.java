@@ -41,8 +41,8 @@ class PartitionTest {
 
     private static List<String> readAll(Partition partition) {
         List<String> messages = new ArrayList<>();
-        for (byte[] message : partition.readMessages(0, 16 * 1024 * 1024)) {
-            messages.add(text(message));
+        for (Protocol.Record record : partition.readMessages(0, 16 * 1024 * 1024)) {
+            messages.add(text(record.getPayload()));
         }
         return messages;
     }
@@ -327,6 +327,38 @@ class PartitionTest {
         assertEquals(List.of("a", "d"), readAll(partition));
         assertEquals(2, partition.getLogEndOffset());
         partition.close();
+    }
+
+    /**
+     * A reader can start earlier than the offset it was asked for: the index falls back
+     * to the last entry it has and the read walks forward from there. What comes back has
+     * to say where it really starts, because everything upstream - the broker's reply,
+     * the client's cursor - is positioned by those offsets. Counting forwards from the
+     * request instead would hand consumers offsets whose messages they never received.
+     */
+    @Test
+    void readsReportTheOffsetEachRecordActuallyOccupies() throws Exception {
+        Partition partition = newPartition("lazy-index");
+        partition.append(message("a"));
+        partition.append(message("b"));
+        partition.append(message("c"));
+
+        // Cut the index down to its first entry, so a read at offset 2 has to fall back
+        // to offset 0 and walk forward.
+        Path index = tempDir.resolve("lazy-index/00000000000000000000.index");
+        try (FileChannel channel = FileChannel.open(index, StandardOpenOption.WRITE)) {
+            channel.truncate(16);
+        }
+
+        List<Protocol.Record> records = partition.readMessages(2, 16 * 1024 * 1024);
+        partition.close();
+
+        assertEquals(3, records.size(), "the fallback reads from offset 0, so all three come back");
+        assertEquals(0, records.get(0).getOffset(), "the reader must report where it really started");
+        assertEquals(1, records.get(1).getOffset());
+        assertEquals(2, records.get(2).getOffset());
+        assertEquals("a", text(records.get(0).getPayload()));
+        assertEquals("c", text(records.get(2).getPayload()));
     }
 
     private static void appendRawBytes(Path file, byte[] bytes) throws Exception {
