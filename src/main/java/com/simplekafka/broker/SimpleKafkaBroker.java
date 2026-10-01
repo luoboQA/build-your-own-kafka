@@ -3,7 +3,10 @@ package com.simplekafka.broker;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
@@ -774,7 +777,15 @@ public class SimpleKafkaBroker {
             }
         } catch (Exception e) {
             if (isRunning.get()) {
-                LOGGER.log(Level.SEVERE, "Error handling client", e);
+                if (isClientDisconnect(e)) {
+                    // A client that vanishes mid-connection is a normal end to a
+                    // connection, not a broker fault: a consumer that exits while a
+                    // fetch is in flight leaves a reset behind, and reporting that as
+                    // SEVERE makes a healthy cluster look broken.
+                    LOGGER.info("Client connection ended: " + e);
+                } else {
+                    LOGGER.log(Level.SEVERE, "Error handling client", e);
+                }
             }
         } finally {
             try {
@@ -785,6 +796,17 @@ public class SimpleKafkaBroker {
                 LOGGER.log(Level.WARNING, "Error closing client channel", e);
             }
         }
+    }
+
+    /**
+     * Whether an exception means "the peer went away" rather than "this broker
+     * failed". Every one of these is delivered at the socket layer, so it says
+     * nothing about whether the request itself was handled correctly.
+     */
+    private static boolean isClientDisconnect(Throwable e) {
+        return e instanceof SocketException
+                || e instanceof ClosedChannelException
+                || e instanceof AsynchronousCloseException;
     }
 
     /**

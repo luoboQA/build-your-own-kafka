@@ -13,10 +13,15 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import org.apache.zookeeper.server.NIOServerCnxnFactory;
 import org.apache.zookeeper.server.ZooKeeperServer;
@@ -172,6 +177,42 @@ class BrokerWireTest {
                 "each pipelined produce must store its own message, in the order it was sent");
     }
 
+    /**
+     * A client that goes away mid-request is a normal end to a connection, not a
+     * broker fault. The smoke test treats any SEVERE line in a broker log as a
+     * failure, so a consumer exiting while a fetch is in flight must not be able to
+     * fail an otherwise healthy cluster.
+     */
+    @Test
+    void aClientThatDisappearsMidRequestIsNotReportedAsABrokerError() throws Exception {
+        LogCapture capture = LogCapture.attach();
+        try {
+            try (SocketChannel channel = SocketChannel.open()) {
+                channel.connect(new InetSocketAddress("127.0.0.1", brokerPort));
+                channel.socket().setSoLinger(true, 0); // so close() resets instead of closing cleanly
+
+                // The request is never completed, so the topic never has to exist.
+                ByteBuffer partial = Protocol.encodeProduceRequest("wire-nowhere", 0, bytes("half"));
+                partial.limit(partial.limit() - 2); // one request short of complete
+                channel.write(partial);
+
+                // The broker now waits for the rest of a request that never arrives.
+                Thread.sleep(200);
+            } // close() with SO_LINGER 0 makes the peer see a connection reset
+
+            // Wait for the broker to have dealt with the reset one way or the other,
+            // then assert on how it dealt with it.
+            awaitTrue("the broker to handle the connection reset", 15_000, () ->
+                    capture.countContaining("Client connection ended") > 0
+                            || capture.count(Level.SEVERE, "Error handling client") > 0);
+
+            assertEquals(0, capture.count(Level.SEVERE, "Error handling client"),
+                    "a client that disconnects mid-request must not be logged as a broker error");
+        } finally {
+            capture.detach();
+        }
+    }
+
     private static byte readTypeByte(SocketChannel channel) throws Exception {
         ByteBuffer type = ByteBuffer.allocate(1);
         Protocol.readFully(channel, type, TIMEOUT);
@@ -246,7 +287,11 @@ class BrokerWireTest {
     }
 
     private static void awaitTrue(String what, Condition condition) throws Exception {
-        long deadline = System.currentTimeMillis() + TIMEOUT;
+        awaitTrue(what, TIMEOUT, condition);
+    }
+
+    private static void awaitTrue(String what, long timeoutMillis, Condition condition) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
         while (System.currentTimeMillis() < deadline) {
             try {
                 if (condition.isMet()) {
@@ -258,6 +303,58 @@ class BrokerWireTest {
             Thread.sleep(100);
         }
         fail("Timed out waiting for " + what);
+    }
+
+    /**
+     * Collects the broker logs so a test can assert on what was reported rather than
+     * scraping stdout.
+     */
+    private static final class LogCapture extends Handler {
+        private final List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
+
+        static LogCapture attach() {
+            LogCapture capture = new LogCapture();
+            capture.setLevel(Level.ALL);
+            Logger.getLogger("com.simplekafka.broker").addHandler(capture);
+            return capture;
+        }
+
+        void detach() {
+            Logger.getLogger("com.simplekafka.broker").removeHandler(this);
+        }
+
+        long count(Level level, String messagePrefix) {
+            synchronized (records) {
+                return records.stream()
+                        .filter(record -> level.equals(record.getLevel()))
+                        .filter(record -> record.getMessage() != null
+                                && record.getMessage().startsWith(messagePrefix))
+                        .count();
+            }
+        }
+
+        long countContaining(String text) {
+            synchronized (records) {
+                return records.stream()
+                        .filter(record -> record.getMessage() != null && record.getMessage().contains(text))
+                        .count();
+            }
+        }
+
+        @Override
+        public void publish(LogRecord record) {
+            if (record != null) {
+                records.add(record);
+            }
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     private static int freePort() throws Exception {
