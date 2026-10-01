@@ -63,6 +63,17 @@ public class SimpleKafkaBroker {
     private final ExecutorService metadataExecutor;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
+        this(brokerId, host, port, new ZookeeperClient("localhost", zkPort));
+    }
+
+    /**
+     * Build a broker around a supplied ZooKeeper client.
+     *
+     * <p>Exists so a test can hand it a client that records what the broker asks for and
+     * in what order - the ordering of a watch against a read is invisible from outside,
+     * and it is the whole guarantee.
+     */
+    SimpleKafkaBroker(int brokerId, String host, int port, ZookeeperClient zkClient) throws IOException {
         this.brokerId = brokerId;
         this.brokerHost = host;
         this.brokerPort = port;
@@ -84,10 +95,10 @@ public class SimpleKafkaBroker {
             dataDir.mkdirs();
         }
 
-        // Initialize ZooKeeper client
-        this.zkClient = new ZookeeperClient("localhost", zkPort);
-        // A session that ends takes this broker's ephemeral nodes and every watch it
-        // registered with it, so it has to be told and put them back.
+        // Initialize ZooKeeper client. A session that ends takes this broker's ephemeral
+        // nodes and every watch it registered with it, so it has to be told and put them
+        // back.
+        this.zkClient = zkClient;
         this.zkClient.setSessionListener(this::onSessionExpired);
     }
 
@@ -780,18 +791,47 @@ public class SimpleKafkaBroker {
                     return;
                 }
                 metadataExecutor.submit(() -> {
+                    // Arm the next watch before reading, the same way watchChildren does.
+                    // A watch is one-shot, so a change that lands between the read and a
+                    // later re-arm produces no event here at all - and this is the only
+                    // way this broker learns that a partition's leader moved, so it would
+                    // go on answering metadata with, and forwarding writes to, a broker
+                    // that is gone. Registering first can only cost a redundant
+                    // notification, which applyPartitionAssignment already ignores.
+                    watchPartitionAssignment(topic, partition);
                     try {
                         applyPartitionAssignment(topic, partition);
                     } catch (Exception e) {
                         LOGGER.log(Level.WARNING, "Failed to apply the assignment of "
                                 + topic + "/" + partition.getId(), e);
                     }
-                    watchPartitionAssignment(topic, partition);
                 });
             });
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to watch the assignment of " + topic + "/" + partition.getId(), e);
+            LOGGER.log(Level.WARNING, "Failed to watch the assignment of " + topic + "/" + partition.getId()
+                    + "; retrying", e);
+            scheduleWatchRetry(topic, partition);
         }
+    }
+
+    /**
+     * Try to arm an assignment watch again shortly.
+     *
+     * <p>Failing to arm it leaves the partition pointed at whatever broker it last
+     * heard about, with nothing to correct it, so a single ZooKeeper hiccup at startup
+     * would otherwise be permanent for that partition.
+     */
+    private void scheduleWatchRetry(String topic, Partition partition) {
+        Thread thread = new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+                watchPartitionAssignment(topic, partition);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "partition-watch-retry-" + brokerId);
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /**
