@@ -130,15 +130,26 @@ public class Partition {
              FileChannel logChannel = logFile.getChannel()) {
             
             ByteBuffer buffer = ByteBuffer.allocate(4); // Size field is 4 bytes
-            
-            while (logChannel.position() < logChannel.size()) {
+            long size = logChannel.size();
+
+            while (logChannel.position() < size) {
                 buffer.clear();
                 int bytesRead = logChannel.read(buffer);
                 if (bytesRead < 4) break;
-                
+
                 buffer.flip();
                 int messageSize = buffer.getInt();
-                
+
+                // The size field comes off the disk, so it is only as trustworthy as
+                // the file. A negative one would move the position backwards - and a
+                // length of -4 exactly cancels the four bytes just read, spinning here
+                // forever; one that runs past the end means the log is torn.
+                if (messageSize < 0 || logChannel.position() + messageSize > size) {
+                    LOGGER.warning("Corrupt message length " + messageSize +
+                            " while counting partition " + id + "; stopping at " + count);
+                    break;
+                }
+
                 // Skip the message
                 logChannel.position(logChannel.position() + messageSize);
                 count++;
@@ -272,39 +283,82 @@ public class Partition {
      * @return the offset where the message was appended, or -1 on failure
      */
     private long doAppend(byte[] message) {
+        if (activeLogChannel == null || !activeLogChannel.isOpen()) {
+            // initialize() gave up, or a truncation failed partway. Reporting it beats
+            // throwing an NPE at whoever asked, and beats the far worse alternative of
+            // writing at an offset nobody chose.
+            LOGGER.warning("Partition " + id + " has no open log to append to");
+            return -1;
+        }
+
         try {
             long currentOffset = nextOffset.get();
-            
+
             // Check if we need to roll over to a new segment
             if (activeLogChannel.position() >= DEFAULT_SEGMENT_SIZE) {
                 activeLogChannel.close();
                 activeLogFile.close();
                 createNewSegment(currentOffset);
             }
-            
+
             // Write message size and data
             ByteBuffer buffer = ByteBuffer.allocate(4 + message.length);
             buffer.putInt(message.length);
             buffer.put(message);
             buffer.flip();
-            
-            // Write to file
+
+            // Write to file, remembering where so a short write can be undone
             long position = activeLogChannel.position();
-            activeLogChannel.write(buffer);
-            
-            // Force write to disk
-            activeLogChannel.force(true);
-            
+            try {
+                writeFully(activeLogChannel, buffer);
+                activeLogChannel.force(true);
+            } catch (IOException e) {
+                // Leave the file exactly as long as it was. A half-written record would
+                // be counted as a message by countMessagesInSegment on the next start,
+                // and every offset after it would describe the wrong bytes.
+                rollBackTo(position);
+                throw e;
+            }
+
             // Update index
             updateIndex(currentOffset, position);
-            
+
             // Update offset
             nextOffset.incrementAndGet();
-            
+
             return currentOffset;
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to append message to partition " + id, e);
             return -1;
+        }
+    }
+
+    /**
+     * Write every byte of the buffer to the file, refusing to accept a short write.
+     *
+     * <p>{@code FileChannel.write} may transfer fewer bytes than asked when the disk
+     * fills or the write is interrupted, and this log has no framing of its own to
+     * recover from: a reader trusts each record's size field, so a record that is not
+     * all there makes everything after it unreadable.
+     */
+    static void writeFully(FileChannel channel, ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            if (channel.write(buffer) <= 0) {
+                throw new IOException("Short write: " + buffer.remaining() + " bytes still to go");
+            }
+        }
+    }
+
+    /**
+     * Cut the log back to {@code position} after a failed append, so the next append
+     * starts where this one did and the offset-to-position mapping stays true.
+     */
+    private void rollBackTo(long position) {
+        try {
+            activeLogChannel.truncate(position);
+            activeLogChannel.position(position);
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Failed to roll partition " + id + " back to " + position, e);
         }
     }
 
@@ -537,7 +591,18 @@ public class Partition {
                     
                     sizeBuffer.flip();
                     int messageSize = sizeBuffer.getInt();
-                    
+
+                    // The length comes off the disk, so it is only as trustworthy as the
+                    // file. Its two siblings already refuse one that runs past the end of
+                    // the segment; without the same check here it would be handed straight
+                    // to the allocator - a negative length throws, a huge one can exhaust
+                    // the heap.
+                    if (messageSize < 0 || logChannel.position() + messageSize > logChannel.size()) {
+                        LOGGER.warning("Corrupt message length " + messageSize + " at offset " +
+                                currentOffset + " of partition " + id);
+                        break;
+                    }
+
                     // Check if adding this message would exceed maxBytes
                     if (bytesRead + messageSize > maxBytes) {
                         break;
@@ -635,8 +700,10 @@ public class Partition {
         try (RandomAccessFile indexFile = new RandomAccessFile(segment.getIndexPath(), "r");
              FileChannel indexChannel = indexFile.getChannel()) {
             
-            if (indexChannel.size() == 0) {
-                // Empty index, start from beginning of log
+            if (indexChannel.size() < 16) {
+                // Not one whole entry: a torn index (or none at all) means start from the
+                // beginning of the log. Reading the last entry would seek to size() - 16,
+                // which for an index of 1..15 bytes is a negative file position.
                 return 0;
             }
             

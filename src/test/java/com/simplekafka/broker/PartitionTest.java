@@ -4,12 +4,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -190,6 +195,111 @@ class PartitionTest {
 
         partition.close();
         assertFalse(Files.exists(assignmentOnly), "a non-replica must not create a partition directory");
+    }
+
+    /**
+     * A partition whose log could not be opened has no channel to append to. Reporting
+     * that is the only safe answer: an NPE thrown at the caller says nothing about what
+     * went wrong, and a partition that guessed an offset would be worse.
+     */
+    @Test
+    void appendFailsInsteadOfThrowingWhenTheLogCouldNotBeInitialized() throws Exception {
+        Path dir = tempDir.resolve("uninitializable");
+        Files.createDirectories(dir);
+        // Ends in .log, so initialize() treats it as a segment and reads the base offset
+        // out of the name - which is not a number, so it gives up before opening anything.
+        Files.write(dir.resolve("not-a-number.log"), new byte[0]);
+
+        Partition partition = new Partition(0, 1, List.of(2), dir.toString());
+        try {
+            assertEquals(-1, partition.append(message("a")),
+                    "a partition with no open log must report the failure, not throw");
+            assertEquals(0, partition.getLogEndOffset());
+        } finally {
+            partition.close();
+        }
+    }
+
+    /**
+     * The index is only as trustworthy as the disk it is on. Reading its last entry
+     * assumes there is one; an index holding a partial entry would otherwise seek to a
+     * negative file position.
+     */
+    @Test
+    void anUndersizedIndexDoesNotBreakReads() throws Exception {
+        Partition partition = newPartition("torn-index");
+        partition.append(message("a"));
+        partition.append(message("b"));
+
+        Path index = tempDir.resolve("torn-index/00000000000000000000.index");
+        try (FileChannel channel = FileChannel.open(index, StandardOpenOption.WRITE)) {
+            channel.truncate(8); // half an entry: no complete index entry at all
+        }
+
+        try {
+            assertEquals(List.of("a", "b"), readAll(partition),
+                    "a torn index must fall back to reading the log from the start");
+        } finally {
+            partition.close();
+        }
+    }
+
+    /**
+     * A record's length is read straight off the disk and then used to size an
+     * allocation. Its siblings refuse a length that runs past the end of the segment;
+     * this path has to as well, or a corrupt one reaches the allocator - negative
+     * throws, huge exhausts the heap.
+     */
+    @Test
+    void aCorruptLengthInTheLogEndsTheReadInsteadOfBeingAllocated() throws Exception {
+        Partition partition = newPartition("negative-length");
+        partition.append(message("a"));
+        partition.append(message("b"));
+
+        // A length field of -4, which cancels its own four bytes.
+        appendRawBytes(tempDir.resolve("negative-length/00000000000000000000.log"),
+                ByteBuffer.allocate(4).putInt(-4).array());
+
+        try {
+            assertEquals(List.of("a", "b"), readAll(partition),
+                    "the corrupt record must end the read, not be allocated for");
+        } finally {
+            partition.close();
+        }
+    }
+
+    /**
+     * Deriving the log end offset means walking the last segment counting records. A
+     * negative length moves the position backwards, and -4 cancels the four bytes just
+     * read, so the walk would never terminate and the broker would never start.
+     */
+    @Test
+    void aCorruptLengthInTheLogDoesNotHangTheRestart() throws Exception {
+        Path dir = tempDir.resolve("corrupt-count");
+        Files.createDirectories(dir);
+
+        byte[] payload = message("a");
+        ByteBuffer log = ByteBuffer.allocate(4 + payload.length + 4);
+        log.putInt(payload.length).put(payload).putInt(-4);
+        Files.write(dir.resolve("00000000000000000000.log"), log.array());
+        Files.write(dir.resolve("00000000000000000000.index"), new byte[16]);
+
+        Assertions.assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+            Partition partition = new Partition(0, 1, List.of(2), dir.toString());
+            try {
+                assertEquals(1, partition.getLogEndOffset(),
+                        "counting must stop at the corrupt record instead of spinning on it");
+            } finally {
+                partition.close();
+            }
+        });
+    }
+
+    private static void appendRawBytes(Path file, byte[] bytes) throws Exception {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+            channel.position(channel.size());
+            Partition.writeFully(channel, ByteBuffer.wrap(bytes));
+        }
     }
 
     private static String prefix(int index) {
