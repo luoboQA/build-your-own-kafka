@@ -1456,9 +1456,73 @@ public class SimpleKafkaBroker {
     }
 
     /**
+     * Forget a broker, as a missed /brokers notification would. Exists so a test can
+     * put this broker in the state a metadata response has to repair.
+     */
+    void forgetBroker(int brokerId) {
+        clusterMetadata.remove(brokerId);
+    }
+
+    /**
+     * Look up any broker a partition assignment names that this broker does not know
+     * about yet. Every metadata response has to describe every broker it names, or the
+     * client is handed a leader it cannot open a connection to.
+     */
+    private void ensureAssignedBrokersAreKnown() {
+        for (List<Partition> partitions : topics.values()) {
+            for (Partition partition : partitions) {
+                ensureKnown(partition.getLeader());
+                for (int follower : partition.getFollowers()) {
+                    ensureKnown(follower);
+                }
+            }
+        }
+    }
+
+    /**
+     * Read one broker's address out of ZooKeeper, if it is there and we did not know it.
+     * A broker that has genuinely gone is simply absent: its /brokers node was ephemeral
+     * and the same session ending is what removed it from the cluster.
+     */
+    private void ensureKnown(int brokerId) {
+        if (brokerId < 0 || clusterMetadata.containsKey(brokerId)) {
+            return;
+        }
+
+        try {
+            String data = zkClient.readDataIfPresent("/brokers/" + brokerId);
+            if (data == null || data.isEmpty()) {
+                return;
+            }
+
+            int separator = data.lastIndexOf(':');
+            if (separator <= 0) {
+                LOGGER.warning("Broker " + brokerId + " registered an address this broker cannot read: " + data);
+                return;
+            }
+
+            BrokerInfo info = new BrokerInfo(brokerId,
+                    data.substring(0, separator),
+                    Integer.parseInt(data.substring(separator + 1)));
+            clusterMetadata.put(brokerId, info);
+            LOGGER.info("Learned broker " + brokerId + " from a partition assignment: " + info);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Could not look up broker " + brokerId, e);
+        }
+    }
+
+    /**
      * Handle metadata request from client
      */
     private void handleMetadataRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
+        // An assignment can name a broker this one has not heard of yet: it arrives
+        // through the partition's own watch, which can beat the /brokers watch that
+        // would add the broker to clusterMetadata. A client cannot route to a leader
+        // whose address its metadata does not carry, and it has no other way to find
+        // out - so fill the gap from ZooKeeper, the same source the assignment came
+        // from, before describing either.
+        ensureAssignedBrokersAreKnown();
+
         // Prepare response with metadata
         int size = 5; // 1 byte for response type, 4 bytes for topic count
 

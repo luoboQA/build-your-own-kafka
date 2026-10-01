@@ -3,6 +3,7 @@ package com.simplekafka.broker;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -416,6 +417,48 @@ class ReplicationOffsetTest {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /**
+     * A client routes by looking a partition's leader up in the broker list it was sent.
+     * An assignment arrives through its own watch and can beat the /brokers watch that
+     * would describe the broker it names, so a metadata response that names a broker it
+     * does not describe hands the client a leader it cannot open a connection to - which
+     * is what "Leader broker not found: 2" was.
+     */
+    @Test
+    void metadataDescribesEveryBrokerAnAssignmentNames() throws Exception {
+        String topic = newTopic();
+        createTopic(topic, 1, (short) 2);
+
+        // Drop a broker from this one's view, the way a missed notification would.
+        int forgetful = BROKER_IDS[0];
+        brokers.get(forgetful).forgetBroker(BROKER_IDS[1]);
+
+        Protocol.MetadataResult metadata = fetchMetadata(portFor(forgetful));
+        assertTrue(metadata.isSuccess(), "metadata request failed: " + metadata.getError());
+
+        List<Integer> described = new ArrayList<>();
+        for (BrokerInfo broker : metadata.getBrokers()) {
+            described.add(broker.getId());
+        }
+
+        Protocol.TopicMetadata describedTopic = null;
+        for (Protocol.TopicMetadata candidate : metadata.getTopics()) {
+            if (candidate.getName().equals(topic)) {
+                describedTopic = candidate;
+            }
+        }
+        assertNotNull(describedTopic, "the response must describe topic " + topic);
+
+        for (Protocol.PartitionMetadata partition : describedTopic.getPartitions()) {
+            assertTrue(described.contains(partition.getLeader()),
+                    "leader " + partition.getLeader() + " is named but not described");
+            for (int replica : partition.getReplicas()) {
+                assertTrue(described.contains(replica),
+                        "replica " + replica + " is named but not described");
+            }
+        }
+    }
 
     private static void produceAndAwaitReplication(String topic, int count) throws Exception {
         int leader = leaderOf(topic, 0);
