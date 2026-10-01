@@ -116,6 +116,59 @@ class ControllerElectionTest {
         }
     }
 
+    /**
+     * The controller has to notice that it stopped being one.
+     *
+     * <p>isController was only cleared when this broker left /brokers, and the winner
+     * never armed a watch on the node it owned - only the losers did. So a controller
+     * whose node went away, which is what an expired session does to it, went on acting
+     * as controller: two brokers writing assignments and both answering create-topic as
+     * the authority.
+     */
+    @Test
+    void aControllerThatLosesItsNodeStopsBelievingItIsController() throws Exception {
+        // Take the cluster apart first: brokers left over from the other test would hold
+        // /controller and make this one a loser rather than the winner.
+        stopAllBrokers();
+
+        // Started alone on purpose. In a race, a broker that loses an attempt arms a
+        // watch on /controller as part of losing, and the winner can pick one up that
+        // way by accident - which is not a guarantee, just a coincidence of timing. With
+        // nobody to race, the only watch the winner can have is the one it arms itself.
+        SimpleKafkaBroker broker = new SimpleKafkaBroker(1, "127.0.0.1", freePort(), zooKeeperPort);
+        broker.start();
+        synchronized (brokers) {
+            brokers.put(1, broker);
+        }
+
+        try (ZooKeeper testClient = connectAsTestClient()) {
+            awaitTrue("the lone broker to take controllership", TIMEOUT,
+                    () -> "1".equals(readController(testClient)));
+            assertTrue(broker.isController(),
+                    "the broker named by /controller must believe it is the controller");
+
+            // Hand the node to nobody in particular behind its back, which is what the
+            // broker's own session ending would do to it.
+            testClient.setData("/controller", "99".getBytes(StandardCharsets.UTF_8), -1);
+
+            awaitTrue("the controller to notice it no longer holds the node", TIMEOUT,
+                    () -> !broker.isController());
+        } finally {
+            stopAllBrokers();
+        }
+    }
+
+    private static void stopAllBrokers() {
+        for (SimpleKafkaBroker running : new ArrayList<>(brokers.values())) {
+            try {
+                running.stop();
+            } catch (Exception ignored) {
+                // best effort
+            }
+        }
+        brokers.clear();
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /**

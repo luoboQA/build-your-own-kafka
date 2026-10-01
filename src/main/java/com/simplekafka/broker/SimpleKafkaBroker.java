@@ -86,6 +86,9 @@ public class SimpleKafkaBroker {
 
         // Initialize ZooKeeper client
         this.zkClient = new ZookeeperClient("localhost", zkPort);
+        // A session that ends takes this broker's ephemeral nodes and every watch it
+        // registered with it, so it has to be told and put them back.
+        this.zkClient.setSessionListener(this::onSessionExpired);
     }
 
     /**
@@ -370,21 +373,33 @@ public class SimpleKafkaBroker {
     private void registerWithZookeeper() {
         try {
             zkClient.connect();
-            String brokerPath = "/brokers/" + brokerId;
-            String brokerData = brokerHost + ":" + brokerPort;
-            zkClient.createEphemeralNode(brokerPath, brokerData);
-
-            // Add broker info to local metadata
-            BrokerInfo selfInfo = new BrokerInfo(brokerId, brokerHost, brokerPort);
-            clusterMetadata.put(brokerId, selfInfo);
-
-            // Watch for other brokers
-            zkClient.watchChildren("/brokers", this::onBrokersChanged);
-
-            LOGGER.info("Registered with ZooKeeper at " + zkClient.getConnectString());
+            joinCluster();
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to register with ZooKeeper", e);
         }
+    }
+
+    /**
+     * Announce this broker and start watching the rest of the cluster.
+     *
+     * <p>Separate from connecting because a session that expired has to do all of this
+     * again - the ephemeral node and the watch went with the session - and must not open
+     * a second connection to do it.
+     */
+    private void joinCluster() throws Exception {
+        String brokerPath = "/brokers/" + brokerId;
+        if (!zkClient.createEphemeralNode(brokerPath, brokerHost + ":" + brokerPort)) {
+            // Either a previous session of ours has not been reaped yet, or two brokers
+            // share an id. Either way the node in ZooKeeper is not this session's, so the
+            // cluster will stop seeing this broker as soon as that session ends.
+            LOGGER.warning("Broker " + brokerId + " already has a /brokers node, which belongs to " +
+                    "a session that has not expired yet; this broker is not visible under its own id");
+        }
+
+        clusterMetadata.put(brokerId, new BrokerInfo(brokerId, brokerHost, brokerPort));
+        zkClient.watchChildren("/brokers", this::onBrokersChanged);
+
+        LOGGER.info("Registered with ZooKeeper at " + zkClient.getConnectString());
     }
 
     /**
@@ -460,8 +475,15 @@ public class SimpleKafkaBroker {
             // falling back to a delayed retry.
             for (int attempt = 0; attempt < 3; attempt++) {
                 if (claimControllership(controllerPath)) {
-                    isController.set(true);
-                    LOGGER.info("This broker is now the active controller");
+                    if (isController.compareAndSet(false, true)) {
+                        LOGGER.info("This broker is now the active controller");
+                    }
+
+                    // Watch the node we just took. Losing it is precisely the event the
+                    // flag has to follow, and the winner otherwise only ends up watching
+                    // it by accident - when a second election attempt of its own happens
+                    // to lose to the node it already holds.
+                    zkClient.watchNode(controllerPath, this::onControllerChange);
 
                     // As controller, ensure all topics are properly replicated
                     rebalancePartitions();
@@ -526,7 +548,66 @@ public class SimpleKafkaBroker {
      */
     private void onControllerChange() {
         LOGGER.info("Controller changed, initiating new election");
+        relinquishControllershipIfLost();
         electController();
+    }
+
+    /**
+     * Give up controllership if /controller no longer names this broker.
+     *
+     * <p>The flag was otherwise only cleared when this broker disappeared from /brokers,
+     * which does not cover the node going away underneath it: its session ending removes
+     * the node, the flag stays set, and the cluster has two brokers acting as controller
+     * - both writing assignments and both answering create-topic as the authority.
+     *
+     * <p>A read that fails is deliberately not treated as losing the node: a transient
+     * ZooKeeper error is not evidence about who holds it.
+     */
+    private void relinquishControllershipIfLost() {
+        if (!isController.get()) {
+            return;
+        }
+
+        try {
+            String holder = zkClient.readDataIfPresent("/controller");
+            if (!String.valueOf(brokerId).equals(holder)) {
+                isController.set(false);
+                LOGGER.warning("This broker is no longer the controller" +
+                        (holder == null ? "; the /controller node is gone" : "; it is now broker " + holder));
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Could not check whether this broker is still the controller", e);
+        }
+    }
+
+    /**
+     * Put back everything a ZooKeeper session ending takes with it.
+     *
+     * <p>An expired session removes this broker's ephemeral nodes - its /brokers entry,
+     * and its claim on /controller - and every watch registered on it. ZookeeperClient
+     * rebuilds the connection and nothing else, because it has no idea what its owner
+     * registered, so without this the broker stays invisible to the cluster and deaf to
+     * every notification until it is restarted.
+     */
+    private void onSessionExpired() {
+        if (!isRunning.get()) {
+            return;
+        }
+
+        LOGGER.warning("ZooKeeper session expired; re-registering this broker");
+        isController.set(false); // whatever the old session said about that died with it
+
+        try {
+            joinCluster();
+            electController();
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to re-register after the ZooKeeper session expired", e);
+        }
+    }
+
+    /** Whether this broker currently believes it is the controller. */
+    boolean isController() {
+        return isController.get();
     }
 
     /**

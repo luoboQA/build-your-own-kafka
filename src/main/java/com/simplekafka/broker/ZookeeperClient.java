@@ -26,6 +26,7 @@ public class ZookeeperClient implements Watcher {
     private final int port;
     private ZooKeeper zooKeeper;
     private CountDownLatch connectedSignal = new CountDownLatch(1);
+    private volatile SessionListener sessionListener;
     
     public ZookeeperClient(String host, int port) {
         this.host = host;
@@ -55,6 +56,24 @@ public class ZookeeperClient implements Watcher {
         return host + ":" + port;
     }
     
+    /**
+     * Told when this client's session ends and a new one has been established.
+     *
+     * <p>A session that expired takes everything registered on it: every ephemeral node
+     * and every watch. This class cannot put those back, because it does not know what
+     * its owner registered - so it says what happened and lets the owner do it.
+     */
+    public interface SessionListener {
+        void onSessionExpired();
+    }
+
+    /**
+     * Register the listener. Called after the replacement session is connected.
+     */
+    public void setSessionListener(SessionListener listener) {
+        this.sessionListener = listener;
+    }
+
     /**
      * Close connection
      */
@@ -274,10 +293,30 @@ public class ZookeeperClient implements Watcher {
                 zooKeeper = new ZooKeeper(getConnectString(), SESSION_TIMEOUT, this);
                 connectedSignal.await();
                 LOGGER.info("Reconnected to ZooKeeper after session expiry");
+                notifySessionExpired();
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to reconnect to ZooKeeper", e);
             }
         }
+    }
+
+    /**
+     * Tell the owner its session ended, off ZooKeeper's event thread.
+     *
+     * <p>The reaction to this has to call back into ZooKeeper to re-register, and a
+     * synchronous call made from the event thread waits for a reply that only the event
+     * thread can deliver - so it has to happen on a thread of its own. This method is
+     * called from {@code process()}, which is that thread.
+     */
+    private void notifySessionExpired() {
+        SessionListener listener = sessionListener;
+        if (listener == null) {
+            return;
+        }
+
+        Thread thread = new Thread(listener::onSessionExpired, "zookeeper-session-expired");
+        thread.setDaemon(true);
+        thread.start();
     }
     
     /**
