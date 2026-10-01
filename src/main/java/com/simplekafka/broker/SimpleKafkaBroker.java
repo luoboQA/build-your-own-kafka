@@ -150,9 +150,17 @@ public class SimpleKafkaBroker {
     }
 
     /**
-     * Load topic metadata from ZooKeeper
+     * Load topic metadata from ZooKeeper.
+     *
+     * <p>Synchronized because the check and the put have to be one step. Two
+     * notifications for the same topic - a controller that sent one twice, or a second
+     * controller - are each handled on their own client thread, and left unsynchronized
+     * both would find the topic absent, both would build a Partition per partition, and
+     * both would put them: the loser's objects are dropped from the map but keep an open
+     * file handle on the same log and their own armed watch, so two writers exist for one
+     * file and only one of them is reachable.
      */
-    private void loadTopic(String topic) throws Exception {
+    synchronized void loadTopic(String topic) throws Exception {
         if (topics.containsKey(topic)) {
             LOGGER.info("Topic already loaded: " + topic);
             return;

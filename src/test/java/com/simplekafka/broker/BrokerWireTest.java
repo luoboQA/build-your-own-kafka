@@ -21,11 +21,18 @@ import java.util.List;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.server.NIOServerCnxnFactory;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.junit.jupiter.api.AfterAll;
@@ -262,6 +269,74 @@ class BrokerWireTest {
         } finally {
             capture.detach();
         }
+    }
+
+    /**
+     * A topic can be announced more than once, and every announcement is handled on its
+     * own connection thread. Loading it has to happen once: a second loader builds a
+     * second Partition for the same log - another open handle on the same file, and
+     * another armed watch - and then drops it by overwriting the map, leaving two
+     * writers for one file with only one of them reachable.
+     */
+    @Test
+    void aTopicAnnouncedTwiceIsLoadedOnce() throws Exception {
+        String topic = newTopic();
+
+        // Write the topic's ZooKeeper nodes directly so no broker has it loaded yet and
+        // every thread below has to do the loading itself.
+        try (ZooKeeper testClient = connectAsTestClient()) {
+            byte[] empty = new byte[0];
+            testClient.create("/topics/" + topic, empty, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            testClient.create("/topics/" + topic + "/partitions", empty,
+                    ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            testClient.create("/topics/" + topic + "/partitions/0",
+                    "1;".getBytes(StandardCharsets.UTF_8), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+
+        LogCapture capture = LogCapture.attach();
+        try {
+            SimpleKafkaBroker broker = brokers.get(0);
+            int loaders = 16;
+            CyclicBarrier barrier = new CyclicBarrier(loaders);
+            List<Thread> threads = new ArrayList<>();
+
+            for (int i = 0; i < loaders; i++) {
+                Thread thread = new Thread(() -> {
+                    try {
+                        barrier.await(20, TimeUnit.SECONDS);
+                        broker.loadTopic(topic);
+                    } catch (Exception ignored) {
+                        // The count of loads is the assertion, not who won.
+                    }
+                });
+                threads.add(thread);
+            }
+            for (Thread thread : threads) {
+                thread.start();
+            }
+            for (Thread thread : threads) {
+                thread.join(TimeUnit.SECONDS.toMillis(30));
+            }
+
+            assertEquals(1, capture.countContaining("Loaded partition 0 for topic " + topic),
+                    "a topic announced several times at once must be built once");
+        } finally {
+            capture.detach();
+        }
+    }
+
+    private static ZooKeeper connectAsTestClient() throws Exception {
+        CountDownLatch connected = new CountDownLatch(1);
+        ZooKeeper zooKeeper = new ZooKeeper("127.0.0.1:" + zooKeeperPort, 15_000, event -> {
+            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                connected.countDown();
+            }
+        });
+        if (!connected.await(15, TimeUnit.SECONDS)) {
+            zooKeeper.close();
+            fail("The test's ZooKeeper client did not connect");
+        }
+        return zooKeeper;
     }
 
     private static byte readTypeByte(SocketChannel channel) throws Exception {
