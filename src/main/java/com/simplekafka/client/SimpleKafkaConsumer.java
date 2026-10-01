@@ -17,11 +17,16 @@ public class SimpleKafkaConsumer {
     private static final Logger LOGGER = Logger.getLogger(SimpleKafkaConsumer.class.getName());
     private static final int MAX_BYTES = 1024 * 1024; // 1MB max fetch size
     private static final int POLL_INTERVAL_MS = 100;
+    /** How many polls in a row may fail before this consumer gives up. */
+    private static final int MAX_CONSECUTIVE_FAILURES = 10;
+    /** Ceiling on the wait between retries. */
+    private static final long MAX_BACKOFF_MS = 5_000;
     
     private final SimpleKafkaClient client;
     private final String topic;
     private final int partition;
-    private long currentOffset;
+    /** Read by the consuming thread and by whoever calls seek; volatile for both. */
+    private volatile long currentOffset;
     private final AtomicBoolean running;
     private Thread consumerThread;
     
@@ -45,7 +50,15 @@ public class SimpleKafkaConsumer {
      * @param startOffset Offset to start consuming from
      */
     public SimpleKafkaConsumer(String bootstrapBroker, int bootstrapPort, String topic, int partition, long startOffset) {
-        this.client = new SimpleKafkaClient(bootstrapBroker, bootstrapPort);
+        this(new SimpleKafkaClient(bootstrapBroker, bootstrapPort), topic, partition, startOffset);
+    }
+
+    /**
+     * Consume through a supplied client. Exists so a test can make a poll fail and watch
+     * what the consuming loop does about it.
+     */
+    SimpleKafkaConsumer(SimpleKafkaClient client, String topic, int partition, long startOffset) {
+        this.client = client;
         this.topic = topic;
         this.partition = partition;
         this.currentOffset = startOffset;
@@ -105,9 +118,12 @@ public class SimpleKafkaConsumer {
     public void startConsuming(MessageHandler handler) {
         if (running.compareAndSet(false, true)) {
             consumerThread = new Thread(() -> {
-                try {
-                    while (running.get()) {
+                int consecutiveFailures = 0;
+
+                while (running.get()) {
+                    try {
                         List<Protocol.Record> records = pollRecords();
+                        consecutiveFailures = 0;
 
                         // Each record is handed over with the offset it occupies, taken
                         // from the record itself. Working it out from the position in the
@@ -121,13 +137,34 @@ public class SimpleKafkaConsumer {
                         if (records.isEmpty()) {
                             Thread.sleep(POLL_INTERVAL_MS);
                         }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception e) {
+                        // A broker restarting or a leader moving is an ordinary event for a
+                        // consumer, not a reason to stop for good. This used to leave the
+                        // loop on the first failure, so an application was left with a
+                        // consumer that had quietly stopped consuming.
+                        consecutiveFailures++;
+                        if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
+                            LOGGER.log(Level.SEVERE, "Giving up after " + consecutiveFailures +
+                                    " consecutive failed polls", e);
+                            break;
+                        }
+
+                        long backoff = Math.min((long) POLL_INTERVAL_MS * consecutiveFailures, MAX_BACKOFF_MS);
+                        LOGGER.log(Level.WARNING, "Poll failed (" + consecutiveFailures + " in a row); retrying in "
+                                + backoff + "ms: " + e.getMessage());
+                        try {
+                            Thread.sleep(backoff);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
-                } catch (Exception e) {
-                    if (running.get()) {
-                        LOGGER.log(Level.SEVERE, "Error in consumer loop", e);
-                    }
-                    running.set(false);
                 }
+
+                running.set(false);
             });
             
             consumerThread.setDaemon(true);
