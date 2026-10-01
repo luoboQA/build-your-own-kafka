@@ -1,5 +1,6 @@
 package com.simplekafka.broker;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -1644,6 +1645,15 @@ public class SimpleKafkaBroker {
     }
 
     /**
+     * Add a broker, as a /brokers notification would. Together with
+     * {@link #forgetBroker} this lets a test change what a metadata response has to
+     * describe while one is being built.
+     */
+    void rememberBroker(BrokerInfo broker) {
+        clusterMetadata.put(broker.getId(), broker);
+    }
+
+    /**
      * Look up any broker a partition assignment names that this broker does not know
      * about yet. Every metadata response has to describe every broker it names, or the
      * client is handed a leader it cannot open a connection to.
@@ -1695,78 +1705,97 @@ public class SimpleKafkaBroker {
      * Handle metadata request from client
      */
     private void handleMetadataRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
+        Protocol.writeFully(clientChannel, encodeMetadataResponse());
+    }
+
+    /**
+     * The bytes a metadata request is answered with.
+     *
+     * <p>Built by encoding each entry into its own buffer and counting the entries that
+     * came out, rather than by sizing one buffer from a pass over the maps and filling
+     * it from a second. Those maps are changed by other threads - a broker joining, a
+     * topic being loaded, a leader moving - and anything that appeared between the two
+     * passes would be written into a buffer sized without it, while anything that
+     * disappeared would leave a count describing an entry that is never written. The
+     * counts here describe exactly what was encoded, so the reply is whole by
+     * construction.
+     */
+    ByteBuffer encodeMetadataResponse() {
         // An assignment can name a broker this one has not heard of yet: it arrives
-        // through the partition's own watch, which can beat the /brokers watch that
-        // would add the broker to clusterMetadata. A client cannot route to a leader
-        // whose address its metadata does not carry, and it has no other way to find
-        // out - so fill the gap from ZooKeeper, the same source the assignment came
-        // from, before describing either.
+        // through the partition's own watch, which can beat the /brokers watch that would
+        // add the broker to clusterMetadata. A client cannot route to a leader whose
+        // address its metadata does not carry, and it has no other way to find out - so
+        // fill the gap from ZooKeeper, the same source the assignment came from, before
+        // describing either.
         ensureAssignedBrokersAreKnown();
 
-        // Prepare response with metadata
-        int size = 5; // 1 byte for response type, 4 bytes for topic count
-
-        // Calculate size for topics metadata. Names are measured in their encoded
-        // bytes, not in chars: the two agree only for ASCII.
-        for (Map.Entry<String, List<Partition>> entry : topics.entrySet()) {
-            size += 6 + Protocol.utf8(entry.getKey()).length; // 2 bytes for length, name, 4 bytes for partition count
-
-            // Add size for each partition
-            size += entry.getValue().size() * 12; // 4 bytes for id, 4 bytes for leader, 4 bytes for follower count
-
-            // Add size for followers
-            for (Partition partition : entry.getValue()) {
-                size += partition.getFollowers().size() * 4; // 4 bytes per follower ID
-            }
-        }
-
-        // Add size for brokers metadata
-        size += 4; // 4 bytes for broker count
-        size += clusterMetadata.size() * 10; // 4 bytes for id, 2 bytes for host length, 4 bytes for port
-
-        // Add size for broker hostnames
-        for (BrokerInfo broker : clusterMetadata.values()) {
-            size += Protocol.utf8(broker.getHost()).length;
-        }
-
-        ByteBuffer response = ByteBuffer.allocate(size);
-        response.put(Protocol.METADATA_RESPONSE);
-
-        // Add broker metadata
-        response.putInt(clusterMetadata.size());
+        ByteArrayOutputStream brokers = new ByteArrayOutputStream();
+        int brokerCount = 0;
         for (BrokerInfo broker : clusterMetadata.values()) {
             byte[] host = Protocol.utf8(broker.getHost());
-            response.putInt(broker.getId());
-            response.putShort((short) host.length);
-            response.put(host);
-            response.putInt(broker.getPort());
+            ByteBuffer entry = ByteBuffer.allocate(4 + 2 + host.length + 4);
+            entry.putInt(broker.getId());
+            entry.putShort((short) host.length);
+            entry.put(host);
+            entry.putInt(broker.getPort());
+            entry.flip();
+            brokers.write(entry.array(), 0, entry.limit());
+            brokerCount++;
         }
 
-        // Add topic metadata
-        response.putInt(topics.size());
+        ByteArrayOutputStream topicData = new ByteArrayOutputStream();
+        int topicCount = 0;
         for (Map.Entry<String, List<Partition>> entry : topics.entrySet()) {
-            String topic = entry.getKey();
+            byte[] topicBytes = Protocol.utf8(entry.getKey());
             List<Partition> partitions = entry.getValue();
 
-            byte[] topicBytes = Protocol.utf8(topic);
-            response.putShort((short) topicBytes.length);
-            response.put(topicBytes);
-            response.putInt(partitions.size());
-
+            // Take each follower list once, so the size and the contents come from the
+            // same reading of it.
+            List<int[]> followers = new ArrayList<>();
             for (Partition partition : partitions) {
-                response.putInt(partition.getId());
-                response.putInt(partition.getLeader());
+                List<Integer> ids = partition.getFollowers();
+                int[] copy = new int[ids.size()];
+                for (int i = 0; i < copy.length; i++) {
+                    copy[i] = ids.get(i);
+                }
+                followers.add(copy);
+            }
 
-                List<Integer> followers = partition.getFollowers();
-                response.putInt(followers.size());
-                for (Integer follower : followers) {
-                    response.putInt(follower);
+            int size = 2 + topicBytes.length + 4;
+            for (int[] copy : followers) {
+                size += 12 + copy.length * 4; // id, leader, follower count, then the ids
+            }
+
+            ByteBuffer topicEntry = ByteBuffer.allocate(size);
+            topicEntry.putShort((short) topicBytes.length);
+            topicEntry.put(topicBytes);
+            topicEntry.putInt(partitions.size());
+            for (int i = 0; i < partitions.size(); i++) {
+                topicEntry.putInt(partitions.get(i).getId());
+                topicEntry.putInt(partitions.get(i).getLeader());
+                int[] copy = followers.get(i);
+                topicEntry.putInt(copy.length);
+                for (int follower : copy) {
+                    topicEntry.putInt(follower);
                 }
             }
+            topicEntry.flip();
+
+            topicData.write(topicEntry.array(), 0, topicEntry.limit());
+            topicCount++;
         }
 
+        byte[] brokerBytes = brokers.toByteArray();
+        byte[] topicBytes = topicData.toByteArray();
+
+        ByteBuffer response = ByteBuffer.allocate(1 + 4 + brokerBytes.length + 4 + topicBytes.length);
+        response.put(Protocol.METADATA_RESPONSE);
+        response.putInt(brokerCount);
+        response.put(brokerBytes);
+        response.putInt(topicCount);
+        response.put(topicBytes);
         response.flip();
-        Protocol.writeFully(clientChannel, response);
+        return response;
     }
 
     /**

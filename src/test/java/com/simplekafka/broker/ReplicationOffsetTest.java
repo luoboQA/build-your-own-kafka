@@ -27,6 +27,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.Watcher;
@@ -457,6 +458,47 @@ class ReplicationOffsetTest {
                 assertTrue(described.contains(replica),
                         "replica " + replica + " is named but not described");
             }
+        }
+    }
+
+    /**
+     * A metadata reply is built while other threads are changing what it has to
+     * describe: brokers joining and leaving, topics being loaded, leaders moving. If
+     * the size comes from one reading of those maps and the contents from another, a
+     * broker that appeared in between is written into a buffer that was sized without
+     * it - the reply does not fit, and the client gets nothing at all.
+     */
+    @Test
+    void aMetadataReplyIsWholeWhileTheClusterChangesUnderIt() throws Exception {
+        String topic = newTopic();
+        createTopic(topic, 2, (short) 2);
+
+        SimpleKafkaBroker subject = brokers.get(BROKER_IDS[0]);
+        // A broker that is not registered in ZooKeeper, so nothing restores it behind the
+        // flapping thread's back - it is purely what changes the size of the reply.
+        BrokerInfo ghost = new BrokerInfo(99, "127.0.0.1", 19999);
+
+        AtomicBoolean flapping = new AtomicBoolean(true);
+        Thread flap = new Thread(() -> {
+            while (flapping.get()) {
+                subject.rememberBroker(ghost);
+                subject.forgetBroker(ghost.getId());
+            }
+        }, "flap-brokers");
+        flap.setDaemon(true);
+        flap.start();
+
+        try {
+            for (int i = 0; i < 100; i++) {
+                Protocol.MetadataResult result = fetchMetadata(portFor(BROKER_IDS[0]));
+                assertTrue(result.isSuccess(),
+                        "a metadata reply must be whole whatever the cluster does while it is built: "
+                                + result.getError());
+            }
+        } finally {
+            flapping.set(false);
+            flap.join(5_000);
+            subject.forgetBroker(ghost.getId());
         }
     }
 
