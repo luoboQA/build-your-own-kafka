@@ -1,5 +1,6 @@
 package com.simplekafka.broker;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
@@ -54,6 +55,11 @@ public class Protocol {
      */
     public static final int MAX_FETCH_RECORDS = 1_000_000;
     public static final int MAX_FETCH_RECORD_BYTES = 16 * 1024 * 1024;
+    /**
+     * Sanity bound for the counts in a metadata reply. A corrupt one would otherwise
+     * decide how many things are read from the socket next.
+     */
+    public static final int MAX_METADATA_ENTRIES = 1_000_000;
     
     /**
      * The UTF-8 bytes of a string.
@@ -421,6 +427,106 @@ public class Protocol {
         return new ProduceResult(offset, status == 0 ? null : "Produce failed");
     }
     
+    /**
+     * Read exactly one metadata response.
+     *
+     * <p>This is the one reply whose size grows with the cluster - a few dozen bytes per
+     * broker and per partition - and it carries no length prefix, so it has to be walked
+     * by its own structure: counts first, each name's length before its bytes. Reading it
+     * into a fixed buffer works until the cluster has enough topics to overflow one, and
+     * then the decode fails on a truncated frame, leaving a client that cannot find any
+     * broker at all.
+     */
+    public static ByteBuffer readMetadataResponse(SocketChannel channel, long timeoutMillis)
+            throws IOException {
+        ByteArrayOutputStream frame = new ByteArrayOutputStream();
+
+        byte[] type = new byte[1];
+        readExactly(channel, type, timeoutMillis);
+        frame.write(type, 0, 1);
+
+        if (type[0] == ERROR_RESPONSE) {
+            byte[] length = new byte[2];
+            readExactly(channel, length, timeoutMillis);
+            frame.write(length, 0, 2);
+            int errorLength = ((length[0] & 0xFF) << 8) | (length[1] & 0xFF);
+            readExactly(channel, frame, errorLength, timeoutMillis);
+            return ByteBuffer.wrap(frame.toByteArray());
+        }
+
+        if (type[0] != METADATA_RESPONSE) {
+            throw new IOException("Unexpected metadata response type: " + type[0]);
+        }
+
+        int brokerCount = readCount(channel, frame, timeoutMillis, "broker");
+        for (int i = 0; i < brokerCount; i++) {
+            readRawInt(channel, frame, timeoutMillis); // id
+            int hostLength = readShort(channel, frame, timeoutMillis);
+            readExactly(channel, frame, hostLength, timeoutMillis);
+            readRawInt(channel, frame, timeoutMillis); // port
+        }
+
+        int topicCount = readCount(channel, frame, timeoutMillis, "topic");
+        for (int i = 0; i < topicCount; i++) {
+            int nameLength = readShort(channel, frame, timeoutMillis);
+            readExactly(channel, frame, nameLength, timeoutMillis);
+
+            int partitionCount = readCount(channel, frame, timeoutMillis, "partition");
+            for (int j = 0; j < partitionCount; j++) {
+                readRawInt(channel, frame, timeoutMillis); // partition id
+                readRawInt(channel, frame, timeoutMillis); // leader, which may be -1
+
+                int replicaCount = readCount(channel, frame, timeoutMillis, "replica");
+                for (int k = 0; k < replicaCount; k++) {
+                    readRawInt(channel, frame, timeoutMillis);
+                }
+            }
+        }
+
+        return ByteBuffer.wrap(frame.toByteArray());
+    }
+
+    /**
+     * Read a count and refuse an implausible one. A count off the wire decides how many
+     * things are read next, so a corrupt one would otherwise have this reading for ever.
+     */
+    private static int readCount(SocketChannel channel, ByteArrayOutputStream frame, long timeoutMillis, String what)
+            throws IOException {
+        int value = readRawInt(channel, frame, timeoutMillis);
+        if (value < 0 || value > MAX_METADATA_ENTRIES) {
+            throw new IOException("Implausible " + what + " count: " + value);
+        }
+        return value;
+    }
+
+    private static int readRawInt(SocketChannel channel, ByteArrayOutputStream frame, long timeoutMillis)
+            throws IOException {
+        byte[] bytes = new byte[4];
+        readExactly(channel, bytes, timeoutMillis);
+        frame.write(bytes, 0, 4);
+        return ((bytes[0] & 0xFF) << 24) | ((bytes[1] & 0xFF) << 16)
+                | ((bytes[2] & 0xFF) << 8) | (bytes[3] & 0xFF);
+    }
+
+    private static int readShort(SocketChannel channel, ByteArrayOutputStream frame, long timeoutMillis)
+            throws IOException {
+        byte[] bytes = new byte[2];
+        readExactly(channel, bytes, timeoutMillis);
+        frame.write(bytes, 0, 2);
+        return ((bytes[0] & 0xFF) << 8) | (bytes[1] & 0xFF);
+    }
+
+    private static void readExactly(SocketChannel channel, byte[] target, long timeoutMillis) throws IOException {
+        readFully(channel, ByteBuffer.wrap(target), timeoutMillis);
+    }
+
+    private static void readExactly(SocketChannel channel, ByteArrayOutputStream frame, int length, long timeoutMillis)
+            throws IOException {
+        byte[] bytes = new byte[length];
+        readFully(channel, ByteBuffer.wrap(bytes), timeoutMillis);
+        frame.write(bytes, 0, length);
+    }
+
     /**
      * Decode metadata response
      */

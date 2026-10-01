@@ -4,6 +4,7 @@ import com.simplekafka.broker.BrokerInfo;
 import com.simplekafka.broker.Protocol;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
@@ -22,12 +23,16 @@ import java.util.logging.Logger;
  */
 public class SimpleKafkaClient {
     private static final Logger LOGGER = Logger.getLogger(SimpleKafkaClient.class.getName());
-    private static final int DEFAULT_BUFFER_SIZE = 4096;
     
     private final String bootstrapBroker;
     private final int bootstrapPort;
-    private final Map<String, TopicMetadata> topicMetadata;
-    private final Map<Integer, BrokerInfo> brokers;
+    /**
+     * Both maps are replaced wholesale on every refresh rather than cleared and refilled,
+     * so a reader on another thread never finds one of them empty in between - which used
+     * to show up as "Topic not found" for a topic that plainly existed.
+     */
+    private volatile Map<String, TopicMetadata> topicMetadata;
+    private volatile Map<Integer, BrokerInfo> brokers;
     private final AtomicInteger correlationId;
     
     /**
@@ -50,58 +55,82 @@ public class SimpleKafkaClient {
         refreshMetadata();
     }
     
-    /**
-     * Refresh metadata about brokers and topics
-     */
     public void refreshMetadata() throws IOException {
-        try (SocketChannel channel = SocketChannel.open()) {
-            channel.connect(new InetSocketAddress(bootstrapBroker, bootstrapPort));
-            
-            // Request metadata
-            ByteBuffer request = Protocol.encodeMetadataRequest();
-            Protocol.writeFully(channel, request);
-            
-            // Read response
-            ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
-            int bytesRead = channel.read(response);
-            if (bytesRead <= 0) {
-                throw new IOException("No data received from broker");
+        List<InetSocketAddress> candidates = new ArrayList<>();
+        candidates.add(new InetSocketAddress(bootstrapBroker, bootstrapPort));
+        for (BrokerInfo broker : brokers.values()) {
+            InetSocketAddress address = new InetSocketAddress(broker.getHost(), broker.getPort());
+            if (!candidates.contains(address)) {
+                candidates.add(address);
             }
-            
-            response.flip();
-            
-            // Parse response
-            Protocol.MetadataResult result = Protocol.decodeMetadataResponse(response);
-            
-            if (!result.isSuccess()) {
-                throw new IOException("Failed to fetch metadata: " + result.getError());
-            }
-            
-            // Update broker information
-            brokers.clear();
-            for (BrokerInfo broker : result.getBrokers()) {
-                brokers.put(broker.getId(), new BrokerInfo(broker.getId(), broker.getHost(), broker.getPort()));
-            }
-            
-            // Update topic metadata
-            topicMetadata.clear();
-            for (Protocol.TopicMetadata topic : result.getTopics()) {
-                List<PartitionInfo> partitions = new ArrayList<>();
-                
-                for (Protocol.PartitionMetadata partition : topic.getPartitions()) {
-                    partitions.add(new PartitionInfo(
-                        partition.getId(),
-                        partition.getLeader(),
-                        partition.getReplicas()
-                    ));
-                }
-                
-                topicMetadata.put(topic.getName(), new TopicMetadata(topic.getName(), partitions));
-            }
-            
-            LOGGER.info("Metadata refreshed: " + brokers.size() + " brokers, " + 
-                       topicMetadata.size() + " topics");
         }
+
+        // The bootstrap address is tried first, then every broker already known. Insisting
+        // on the bootstrap alone makes it a single point of failure for a client that has a
+        // list of live brokers: the cluster can be perfectly healthy and the client still
+        // unable to refresh, because the one address it will talk to has gone.
+        IOException lastFailure = null;
+        for (InetSocketAddress address : candidates) {
+            try {
+                publish(readMetadataFrom(address));
+                return;
+            } catch (IOException | RuntimeException e) {
+                lastFailure = new IOException("Metadata request to " + address + " failed", e);
+            }
+        }
+
+        throw lastFailure == null
+                ? new IOException("No broker available to ask for metadata")
+                : lastFailure;
+    }
+
+    private Protocol.MetadataResult readMetadataFrom(InetSocketAddress address) throws IOException {
+        try (SocketChannel channel = SocketChannel.open()) {
+            channel.connect(address);
+
+            // Request metadata
+            Protocol.writeFully(channel, Protocol.encodeMetadataRequest());
+
+            // Read response. This is the one reply with no fixed size: it grows with the
+            // cluster, so it is walked by its own structure rather than read into a buffer
+            // that a large enough cluster would overflow.
+            ByteBuffer response = Protocol.readMetadataResponse(channel, Protocol.DEFAULT_IO_TIMEOUT_MS);
+
+            // Parse response
+            return Protocol.decodeMetadataResponse(response);
+        }
+    }
+
+    private void publish(Protocol.MetadataResult result) throws IOException {
+        if (!result.isSuccess()) {
+            throw new IOException("Failed to fetch metadata: " + result.getError());
+        }
+
+        // Built into fresh maps and published by replacing the references, so a reader on
+        // another thread never finds one half-filled.
+        Map<Integer, BrokerInfo> freshBrokers = new ConcurrentHashMap<>();
+        for (BrokerInfo broker : result.getBrokers()) {
+            freshBrokers.put(broker.getId(), new BrokerInfo(broker.getId(), broker.getHost(), broker.getPort()));
+        }
+
+        Map<String, TopicMetadata> freshTopics = new ConcurrentHashMap<>();
+        for (Protocol.TopicMetadata topic : result.getTopics()) {
+            List<PartitionInfo> partitions = new ArrayList<>();
+            for (Protocol.PartitionMetadata partition : topic.getPartitions()) {
+                partitions.add(new PartitionInfo(
+                    partition.getId(),
+                    partition.getLeader(),
+                    partition.getReplicas()
+                ));
+            }
+            freshTopics.put(topic.getName(), new TopicMetadata(topic.getName(), partitions));
+        }
+
+        this.brokers = freshBrokers;
+        this.topicMetadata = freshTopics;
+
+        LOGGER.info("Metadata refreshed: " + freshBrokers.size() + " brokers, " +
+                   freshTopics.size() + " topics");
     }
     
     /**
@@ -125,29 +154,31 @@ public class SimpleKafkaClient {
             ByteBuffer request = Protocol.encodeCreateTopicRequest(topic, numPartitions, replicationFactor);
             Protocol.writeFully(channel, request);
             
-            // Read response
-            ByteBuffer response = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE);
-            int bytesRead = channel.read(response);
-            if (bytesRead <= 0) {
-                throw new IOException("No data received from broker");
-            }
-            
-            response.flip();
-            
-            byte responseType = response.get();
+            // Read response. One byte tells the shape - a bare status, or an error frame
+            // with its own length - so it is read that way rather than into a fixed buffer
+            // that a long enough error message would overflow.
+            byte[] typeBytes = new byte[1];
+            Protocol.readFully(channel, ByteBuffer.wrap(typeBytes), Protocol.DEFAULT_IO_TIMEOUT_MS);
+            byte responseType = typeBytes[0];
+
             if (responseType != Protocol.CREATE_TOPIC_RESPONSE) {
                 if (responseType == Protocol.ERROR_RESPONSE) {
-                    byte[] errorBytes = new byte[response.getShort() & 0xFFFF];
-                    response.get(errorBytes);
+                    byte[] lengthBytes = new byte[2];
+                    Protocol.readFully(channel, ByteBuffer.wrap(lengthBytes), Protocol.DEFAULT_IO_TIMEOUT_MS);
+                    int errorLength = ((lengthBytes[0] & 0xFF) << 8) | (lengthBytes[1] & 0xFF);
+
+                    byte[] errorBytes = new byte[errorLength];
+                    Protocol.readFully(channel, ByteBuffer.wrap(errorBytes), Protocol.DEFAULT_IO_TIMEOUT_MS);
                     String error = new String(errorBytes, StandardCharsets.UTF_8);
                     LOGGER.warning("Error creating topic: " + error);
                     return false;
                 }
                 throw new IOException("Invalid create topic response type: " + responseType);
             }
-            
-            byte status = response.get();
-            boolean success = status == 0;
+
+            byte[] statusBytes = new byte[1];
+            Protocol.readFully(channel, ByteBuffer.wrap(statusBytes), Protocol.DEFAULT_IO_TIMEOUT_MS);
+            boolean success = statusBytes[0] == 0;
             
             if (success) {
                 // Refresh metadata to include new topic
@@ -161,61 +192,45 @@ public class SimpleKafkaClient {
     /**
      * Produce a message to a topic-partition
      */
+    /**
+     * Produce a message to a topic-partition
+     */
     public long send(String topic, int partition, byte[] message) throws IOException {
-        if (!topicMetadata.containsKey(topic)) {
-            refreshMetadata();
-            if (!topicMetadata.containsKey(topic)) {
-                throw new IOException("Topic not found: " + topic);
-            }
-        }
-        
-        // Find the leader for the partition
-        TopicMetadata metadata = topicMetadata.get(topic);
-        PartitionInfo partitionInfo = null;
-        
-        for (PartitionInfo info : metadata.getPartitions()) {
-            if (info.getId() == partition) {
-                partitionInfo = info;
-                break;
-            }
-        }
-        
-        if (partitionInfo == null) {
-            throw new IOException("Partition not found: " + partition);
-        }
-        
-        int leaderId = partitionInfo.getLeader();
-        BrokerInfo leader = brokers.get(leaderId);
-        
-        if (leader == null) {
-            refreshMetadata();
-            leader = brokers.get(leaderId);
-            
-            if (leader == null) {
-                throw new IOException("Leader broker not found: " + leaderId);
-            }
-        }
-        
-        // Send to leader
+        return send(topic, partition, message, true);
+    }
+
+    private long send(String topic, int partition, byte[] message, boolean mayRetry) throws IOException {
+        BrokerInfo leader = leaderFor(topic, partition);
+
         try (SocketChannel channel = SocketChannel.open()) {
             channel.connect(new InetSocketAddress(leader.getHost(), leader.getPort()));
-            
+
             // Send produce request
             ByteBuffer request = Protocol.encodeProduceRequest(topic, partition, message);
             Protocol.writeFully(channel, request);
-            
+
             // Read response. The leader waits for its followers to store the message
-            // before it replies, so the answer can arrive well after the request - and
-            // it may well arrive in more than one piece.
+            // before it replies, so the answer can arrive well after the request - and it
+            // may well arrive in more than one piece.
             ByteBuffer response = Protocol.readProduceResponse(channel, Protocol.PRODUCE_RESPONSE_TIMEOUT_MS);
-            
+
             Protocol.ProduceResult result = Protocol.decodeProduceResponse(response);
-            
+
             if (!result.isSuccess()) {
                 throw new IOException("Failed to produce message: " + result.getError());
             }
-            
+
             return result.getOffset();
+        } catch (ConnectException e) {
+            // The broker was never reached, so nothing can have been written there. That is
+            // what makes this safe to retry, and a timeout is not: a produce that timed out
+            // may well have been accepted, and retrying it would duplicate the message.
+            if (!mayRetry) {
+                throw e;
+            }
+            LOGGER.warning("Broker " + leader.getId() + " is unreachable; refreshing metadata and retrying");
+            refreshMetadata();
+            return send(topic, partition, message, false);
         }
     }
     
@@ -240,47 +255,19 @@ public class SimpleKafkaClient {
      */
     public List<Protocol.Record> fetchRecords(String topic, int partition, long offset, int maxBytes)
             throws IOException {
-        if (!topicMetadata.containsKey(topic)) {
-            refreshMetadata();
-            if (!topicMetadata.containsKey(topic)) {
-                throw new IOException("Topic not found: " + topic);
-            }
-        }
-        
-        // Find the leader for the partition
-        TopicMetadata metadata = topicMetadata.get(topic);
-        PartitionInfo partitionInfo = null;
-        
-        for (PartitionInfo info : metadata.getPartitions()) {
-            if (info.getId() == partition) {
-                partitionInfo = info;
-                break;
-            }
-        }
-        
-        if (partitionInfo == null) {
-            throw new IOException("Partition not found: " + partition);
-        }
-        
-        int leaderId = partitionInfo.getLeader();
-        BrokerInfo leader = brokers.get(leaderId);
-        
-        if (leader == null) {
-            refreshMetadata();
-            leader = brokers.get(leaderId);
-            
-            if (leader == null) {
-                throw new IOException("Leader broker not found: " + leaderId);
-            }
-        }
-        
+        return fetchRecords(topic, partition, offset, maxBytes, true);
+    }
+
+    private List<Protocol.Record> fetchRecords(String topic, int partition, long offset, int maxBytes,
+            boolean mayRetry) throws IOException {
+        BrokerInfo leader = leaderFor(topic, partition);
+
         // Fetch from leader
         try (SocketChannel channel = SocketChannel.open()) {
             channel.connect(new InetSocketAddress(leader.getHost(), leader.getPort()));
-            
+
             // Send fetch request
-            ByteBuffer request = Protocol.encodeFetchRequest(topic, partition, offset, maxBytes);
-            Protocol.writeFully(channel, request);
+            Protocol.writeFully(channel, Protocol.encodeFetchRequest(topic, partition, offset, maxBytes));
 
             // Read response. A fetch answer can be far larger than a socket buffer, so it
             // is walked frame by frame instead of read once and hoped for.
@@ -288,6 +275,16 @@ public class SimpleKafkaClient {
                     Protocol.readFetchResponse(channel, Protocol.DEFAULT_IO_TIMEOUT_MS);
 
             if (!result.isSuccess()) {
+                // Only the leader answers reads, so being told this broker is not it means
+                // the assignment moved. Refreshing and asking the broker that leads now is
+                // the whole recovery: without it a client that cached the old leader could
+                // never read that partition again.
+                if (mayRetry && result.getError() != null && result.getError().contains("is not the leader")) {
+                    LOGGER.warning("Broker " + leader.getId() + " no longer leads " + topic + "/" + partition +
+                            "; refreshing metadata and retrying");
+                    refreshMetadata();
+                    return fetchRecords(topic, partition, offset, maxBytes, false);
+                }
                 throw new IOException("Failed to fetch messages: " + result.getError());
             }
 
@@ -298,7 +295,57 @@ public class SimpleKafkaClient {
                 records.add(new Protocol.Record(offsets[i], messages[i]));
             }
             return records;
+        } catch (ConnectException e) {
+            if (!mayRetry) {
+                throw e;
+            }
+            LOGGER.warning("Broker " + leader.getId() + " is unreachable; refreshing metadata and retrying");
+            refreshMetadata();
+            return fetchRecords(topic, partition, offset, maxBytes, false);
         }
+    }
+
+    /**
+     * The broker that leads a partition.
+     *
+     * <p>The partition is looked up again after a refresh rather than reusing the leader id
+     * read before it. The whole point of refreshing is that the assignment may have moved,
+     * so checking the old id against the new broker list would either find nothing or find
+     * the broker that was just replaced.
+     */
+    private BrokerInfo leaderFor(String topic, int partition) throws IOException {
+        PartitionInfo info = partitionInfo(topic, partition);
+
+        BrokerInfo leader = brokers.get(info.getLeader());
+        if (leader == null) {
+            // No address for the broker the assignment names: refreshing is the only way
+            // to learn one, because the assignment came from the same place.
+            refreshMetadata();
+            info = partitionInfo(topic, partition);
+            leader = brokers.get(info.getLeader());
+        }
+
+        if (leader == null) {
+            throw new IOException("Leader broker " + info.getLeader() + " of " + topic + "/" + partition +
+                    " is not in the cluster metadata");
+        }
+        return leader;
+    }
+
+    private PartitionInfo partitionInfo(String topic, int partition) throws IOException {
+        if (!topicMetadata.containsKey(topic)) {
+            refreshMetadata();
+            if (!topicMetadata.containsKey(topic)) {
+                throw new IOException("Topic not found: " + topic);
+            }
+        }
+
+        for (PartitionInfo info : topicMetadata.get(topic).getPartitions()) {
+            if (info.getId() == partition) {
+                return info;
+            }
+        }
+        throw new IOException("Partition not found: " + partition);
     }
     
     /**
