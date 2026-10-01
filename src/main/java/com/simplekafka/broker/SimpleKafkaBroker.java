@@ -736,8 +736,11 @@ public class SimpleKafkaBroker {
                     ByteBuffer frame = pending.duplicate();
                     frame.clear();
                     frame.limit(frameLength);
-                    dropConsumedBytes(pending, frameLength);
+                    // The frame must be parsed before the buffer is compacted: duplicate()
+                    // shares the backing array, so dropConsumedBytes' arraycopy would
+                    // overwrite this frame's first bytes with the request behind it.
                     processClientMessage(clientChannel, frame);
+                    dropConsumedBytes(pending, frameLength);
                     continue;
                 }
 
