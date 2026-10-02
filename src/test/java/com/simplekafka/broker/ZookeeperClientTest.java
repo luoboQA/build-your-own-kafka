@@ -1,7 +1,18 @@
 package com.simplekafka.broker;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+
+import org.apache.zookeeper.KeeperException;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -89,6 +100,54 @@ class ZookeeperClientTest {
         Thread.sleep(500);
 
         Assertions.assertTimeoutPreemptively(Duration.ofSeconds(20), broker::stop);
+    }
+
+    /**
+     * A watch that cannot reach ZooKeeper is a transport problem, not a broker failure.
+     *
+     * <p>This client rides out a lost or expired session by itself, so a blip would
+     * otherwise paint a healthy broker's log red - and anything at SEVERE is read as a
+     * failure by smoke.sh, which means a blip could fail a run against a cluster that did
+     * nothing wrong. Anything that is not a session problem is still an error.
+     */
+    @Test
+    void aSessionProblemIsNotReportedAsABrokerError() {
+        List<String> severe = Collections.synchronizedList(new ArrayList<>());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (Level.SEVERE.equals(record.getLevel()) && record.getMessage() != null) {
+                    severe.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        capture.setLevel(Level.ALL);
+        Logger.getLogger("com.simplekafka.broker").addHandler(capture);
+
+        try {
+            ZookeeperClient.logWatchFailure("Watching /brokers failed",
+                    new KeeperException.SessionExpiredException());
+            ZookeeperClient.logWatchFailure("Watching /brokers failed",
+                    new KeeperException.ConnectionLossException());
+
+            assertEquals(0, severe.size(),
+                    "a session that has gone is something this client recovers from, not a broker error");
+
+            ZookeeperClient.logWatchFailure("Watching /brokers failed", new RuntimeException("genuinely wrong"));
+
+            assertEquals(1, severe.size(),
+                    "anything that is not a session problem must still be reported as an error");
+        } finally {
+            Logger.getLogger("com.simplekafka.broker").removeHandler(capture);
+        }
     }
 
     private static int freePort() throws IOException {

@@ -170,6 +170,27 @@ public class ZookeeperClient implements Watcher {
     }
 
     /**
+     * Report a failed watch operation at a level that matches what it means.
+     *
+     * <p>A session that has expired or a connection that has been lost is a transport
+     * condition, and it is the one this class exists to ride out: it reconnects by itself
+     * and tells the owner to put its registrations back. Logging it as a broker failure
+     * paints a healthy broker's log red every time ZooKeeper blinks - and any line at
+     * SEVERE is read as a failure by smoke.sh, so a blip could fail a run against a
+     * cluster that did nothing wrong. Anything else here really is unexpected.
+     */
+    static void logWatchFailure(String what, Exception e) {
+        if (e instanceof KeeperException.SessionExpiredException
+                || e instanceof KeeperException.ConnectionLossException
+                || e instanceof KeeperException.SessionMovedException
+                || e instanceof KeeperException.OperationTimeoutException) {
+            LOGGER.log(Level.WARNING, what + " - the ZooKeeper session is not usable: " + e.getMessage());
+        } else {
+            LOGGER.log(Level.SEVERE, what, e);
+        }
+    }
+
+    /**
      * Delete a node and whatever it holds, if it is there.
      *
      * <p>Unlike {@link #deleteEmptyNode} this makes no assumption about the contents or
@@ -277,13 +298,13 @@ public class ZookeeperClient implements Watcher {
                         });
                         callback.onChildrenChanged(newChildren);
                     } catch (Exception e) {
-                        LOGGER.log(Level.SEVERE, "Error processing children changed event", e);
+                        logWatchFailure("Error processing children changed event", e);
                     }
                 }
             });
             callback.onChildrenChanged(children);
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to watch children for path: " + path, e);
+            logWatchFailure("Failed to watch children for path: " + path, e);
         }
     }
     
@@ -302,7 +323,7 @@ public class ZookeeperClient implements Watcher {
                 }
             });
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to watch node: " + path, e);
+            logWatchFailure("Failed to watch node: " + path, e);
         }
     }
     
