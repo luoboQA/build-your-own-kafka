@@ -158,6 +158,36 @@ class ControllerElectionTest {
         }
     }
 
+    /**
+     * A scheduled election retry must not run once the broker has stopped.
+     *
+     * <p>electController falls back to scheduling itself again a second or two later, and
+     * that thread never asked whether the broker was still running. It woke up after stop()
+     * had closed ZooKeeper, failed with SessionExpired, logged it at SEVERE and scheduled
+     * another one - for ever, every couple of seconds, in a process that was shutting down
+     * and had nothing left to elect. That noise is what a test run's teardown looked like.
+     */
+    @Test
+    void aStoppedBrokerDoesNotRunAScheduledElection() throws Exception {
+        // Run alone, like the test above: leftover brokers would hold /controller.
+        stopAllBrokers();
+
+        SimpleKafkaBroker broker = new SimpleKafkaBroker(1, "127.0.0.1", freePort(), zooKeeperPort);
+        broker.start();
+        broker.stop();
+
+        LogCapture capture = LogCapture.attach();
+        try {
+            // Exactly what the retry thread does when its sleep ends.
+            broker.electController();
+
+            assertEquals(0, capture.count(Level.SEVERE, "Controller election failed"),
+                    "a broker that has stopped has nothing to elect and must not report failing to");
+        } finally {
+            capture.detach();
+        }
+    }
+
     private static void stopAllBrokers() {
         for (SimpleKafkaBroker running : new ArrayList<>(brokers.values())) {
             try {

@@ -521,7 +521,18 @@ public class SimpleKafkaBroker {
      * normal outcome for most brokers and must never be logged as an election
      * failure - only a real ZooKeeper error is.
      */
-    private void electController() {
+    void electController() {
+        if (!isRunning.get()) {
+            // Reached in two ways, both of them after there is nothing left to elect: a
+            // retry that was scheduled a second or two earlier and has just woken up, and
+            // a watch delivered while the broker is stopping. Carrying on would fail -
+            // ZooKeeper is closing with everything else - and the catch below would log a
+            // SEVERE and schedule another retry, for ever, in a process that is shutting
+            // down. Stopping here also ends that chain, because the rescheduling only
+            // happens past this point.
+            return;
+        }
+
         try {
             String controllerPath = "/controller";
 
