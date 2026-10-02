@@ -34,3 +34,4 @@ sleep 5
 echo "集群已启动！"
 echo "发送消息: java -cp $JAR com.simplekafka.client.SimpleKafkaProducer localhost 9091 test-topic"
 echo "消费消息: java -cp $JAR com.simplekafka.client.SimpleKafkaConsumer localhost 9091 test-topic 0"
+echo "从指定 offset 消费: java -cp $JAR com.simplekafka.client.SimpleKafkaConsumer localhost 9091 test-topic 0 5"

@@ -1,6 +1,8 @@
 package com.simplekafka.client;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -15,7 +17,8 @@ import org.junit.jupiter.api.Test;
 import com.simplekafka.broker.Protocol;
 
 /**
- * What the consuming loop does when a poll fails.
+ * What the consuming loop does when a poll fails, and what the command line may say
+ * about where consumption starts.
  *
  * <p>A broker restarting, or a leader moving to another replica, is an ordinary event for
  * a consumer. Leaving the loop on the first failure leaves the application holding a
@@ -77,5 +80,67 @@ class SimpleKafkaConsumerTest {
         } finally {
             consumer.close();
         }
+    }
+
+    /**
+     * Where consumption starts is a command-line choice, not something to recompile for.
+     * It may be given as a fifth argument or as an option; with neither, it is 0.
+     */
+    @Test
+    void theCommandLineMaySayWhereToStart() {
+        String[] required = { "broker", "9091", "topic", "0" };
+
+        assertEquals(0, SimpleKafkaConsumer.parseArgs(required).startOffset,
+                "an offset left off the command line means the beginning of the partition");
+
+        assertEquals(7, SimpleKafkaConsumer.parseArgs(with(required, "7")).startOffset,
+                "a fifth argument sets the offset to start from");
+        assertEquals(7, SimpleKafkaConsumer.parseArgs(with(required, "--offset", "7")).startOffset,
+                "--offset sets the offset to start from");
+        assertEquals(7, SimpleKafkaConsumer.parseArgs(with(required, "--offset=7")).startOffset,
+                "--offset= sets the offset to start from");
+    }
+
+    /**
+     * A command line that cannot name an offset it was given must be refused up front,
+     * rather than starting the consumer somewhere the caller did not ask for.
+     */
+    @Test
+    void anOffsetThatIsNotACountIsRefused() {
+        String[] required = { "broker", "9091", "topic", "0" };
+
+        assertThrows(IllegalArgumentException.class,
+                () -> SimpleKafkaConsumer.parseArgs(with(required, "seven")),
+                "a non-numeric offset must be refused");
+        assertThrows(IllegalArgumentException.class,
+                () -> SimpleKafkaConsumer.parseArgs(with(required, "-1")),
+                "a negative offset must be refused");
+        assertThrows(IllegalArgumentException.class,
+                () -> SimpleKafkaConsumer.parseArgs(with(required, "--offset")),
+                "--offset without a value must be refused");
+        assertThrows(IllegalArgumentException.class,
+                () -> SimpleKafkaConsumer.parseArgs(new String[] { "broker", "9091", "topic" }),
+                "a command line that names no partition must be refused");
+    }
+
+    /**
+     * The four required arguments are still read the same way they always were.
+     */
+    @Test
+    void theRequiredArgumentsAreStillRead() {
+        SimpleKafkaConsumer.CommandLine commandLine =
+                SimpleKafkaConsumer.parseArgs(new String[] { "broker", "9092", "topic", "3" });
+
+        assertEquals("broker", commandLine.broker);
+        assertEquals(9092, commandLine.port);
+        assertEquals("topic", commandLine.topic);
+        assertEquals(3, commandLine.partition);
+    }
+
+    private static String[] with(String[] args, String... extra) {
+        String[] all = new String[args.length + extra.length];
+        System.arraycopy(args, 0, all, 0, args.length);
+        System.arraycopy(extra, 0, all, args.length, extra.length);
+        return all;
     }
 }

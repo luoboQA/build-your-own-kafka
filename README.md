@@ -63,6 +63,13 @@ java -cp target/build-your-own-kafka-1.0-SNAPSHOT.jar com.simplekafka.client.Sim
 java -cp target/build-your-own-kafka-1.0-SNAPSHOT.jar com.simplekafka.client.SimpleKafkaConsumer localhost 9091 test-topic 0
 ```
 
+Consumption starts at offset 0 unless you say otherwise. Pass the offset as a fifth
+argument, or as `--offset <n>` / `--offset=<n>`:
+```shell
+java -cp target/build-your-own-kafka-1.0-SNAPSHOT.jar com.simplekafka.client.SimpleKafkaConsumer localhost 9091 test-topic 0 5
+java -cp target/build-your-own-kafka-1.0-SNAPSHOT.jar com.simplekafka.client.SimpleKafkaConsumer localhost 9091 test-topic 0 --offset 5
+```
+
 ### Key Concepts to Focus On During Testing
 
 #### 1. Topic Partitioning and Replication

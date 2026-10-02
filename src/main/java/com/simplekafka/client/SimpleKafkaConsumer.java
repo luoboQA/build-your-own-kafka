@@ -220,25 +220,119 @@ public class SimpleKafkaConsumer {
         void handle(byte[] message, long offset);
     }
     
+    /** Command line option for the offset to start consuming from. */
+    private static final String OFFSET_OPTION = "--offset";
+
+    /** The command line, once the starting offset has been pulled out of it. */
+    static final class CommandLine {
+        final String broker;
+        final int port;
+        final String topic;
+        final int partition;
+        final long startOffset;
+
+        CommandLine(String broker, int port, String topic, int partition, long startOffset) {
+            this.broker = broker;
+            this.port = port;
+            this.topic = topic;
+            this.partition = partition;
+            this.startOffset = startOffset;
+        }
+    }
+
+    /**
+     * Read the command line.
+     *
+     * <p>Four positional arguments are required: broker, port, topic and partition. The
+     * offset to start from is optional and may be given either as a fifth positional
+     * argument or as {@code --offset <n>} / {@code --offset=<n>} anywhere on the command
+     * line; with neither, consumption starts at 0.
+     *
+     * @throws IllegalArgumentException if the command line does not make sense
+     */
+    static CommandLine parseArgs(String[] args) {
+        List<String> positional = new ArrayList<>();
+        long startOffset = 0;
+
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if (OFFSET_OPTION.equals(arg)) {
+                if (i + 1 >= args.length) {
+                    throw new IllegalArgumentException(OFFSET_OPTION + " needs a value");
+                }
+                startOffset = parseOffset(args[++i]);
+            } else if (arg.startsWith(OFFSET_OPTION + "=")) {
+                startOffset = parseOffset(arg.substring(OFFSET_OPTION.length() + 1));
+            } else if (arg.startsWith("--")) {
+                throw new IllegalArgumentException("Unknown option: " + arg);
+            } else {
+                positional.add(arg);
+            }
+        }
+
+        if (positional.size() < 4) {
+            throw new IllegalArgumentException(
+                    "expected <broker> <port> <topic> <partition>, got " + positional.size() + " argument(s)");
+        }
+        if (positional.size() > 4) {
+            // Whatever sits past the four required arguments is the offset.
+            startOffset = parseOffset(positional.get(4));
+        }
+        if (positional.size() > 5) {
+            throw new IllegalArgumentException("Unexpected argument: " + positional.get(5));
+        }
+
+        return new CommandLine(positional.get(0), parseNumber(positional.get(1), "port"),
+                positional.get(2), parseNumber(positional.get(3), "partition"), startOffset);
+    }
+
+    private static int parseNumber(String value, String name) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(name + " must be an integer: " + value);
+        }
+    }
+
+    private static long parseOffset(String value) {
+        long offset;
+        try {
+            offset = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("offset must be an integer: " + value);
+        }
+        if (offset < 0) {
+            throw new IllegalArgumentException("offset must not be negative: " + offset);
+        }
+        return offset;
+    }
+
+    private static void printUsage() {
+        System.out.println("Usage: SimpleKafkaConsumer <broker> <port> <topic> <partition> [offset]");
+        System.out.println("       The offset may also be given as --offset <n> or --offset=<n>; it defaults to 0.");
+    }
+
     /**
      * Main method for demonstration
      */
     public static void main(String[] args) {
-        if (args.length < 4) {
-            System.out.println("Usage: SimpleKafkaConsumer <broker> <port> <topic> <partition>");
-            System.exit(1);
-        }
-        
-        String broker = args[0];
-        int port = Integer.parseInt(args[1]);
-        String topic = args[2];
-        int partition = Integer.parseInt(args[3]);
-        
+        CommandLine commandLine;
         try {
-            SimpleKafkaConsumer consumer = new SimpleKafkaConsumer(broker, port, topic, partition);
+            commandLine = parseArgs(args);
+        } catch (IllegalArgumentException e) {
+            System.out.println(e.getMessage());
+            printUsage();
+            System.exit(1);
+            return;
+        }
+
+        try {
+            SimpleKafkaConsumer consumer = new SimpleKafkaConsumer(commandLine.broker, commandLine.port,
+                    commandLine.topic, commandLine.partition, commandLine.startOffset);
             consumer.initialize();
-            
-            System.out.println("Consumer initialized. Starting consumption...");
+
+            System.out.println("Consumer initialized. Starting consumption from offset "
+                    + commandLine.startOffset + "...");
             
             // Consume messages and print them
             consumer.startConsuming((message, offset) -> {
