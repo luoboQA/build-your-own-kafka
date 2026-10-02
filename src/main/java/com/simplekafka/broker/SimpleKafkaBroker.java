@@ -1531,6 +1531,26 @@ public class SimpleKafkaBroker {
     /**
      * Handle replication request from leader
      */
+    /**
+     * Store a message at the offset the leader picked for it, and say where this replica's
+     * log now ends so the leader can re-send anything that is missing.
+     *
+     * <p><strong>What this request can do, and who can send it.</strong> {@code appendAt}
+     * is a compare-and-truncate: when the payload at an offset differs from what is stored,
+     * it deletes the log from that offset onwards and writes the leader's version instead.
+     * That is exactly what a replica needs once it has diverged - and it is equally a way
+     * to erase a partition. Nothing here checks that the caller is the leader, a replica of
+     * this partition, or a broker at all. Anyone who can open a connection to this port can
+     * send one.
+     *
+     * <p>Real Kafka authenticates brokers to each other. This implementation has no
+     * authentication anywhere - a client can create a topic, produce and fetch without
+     * identifying itself either - so authenticating this one endpoint would be a gesture
+     * rather than a fix, and it is deliberately not attempted. It is written down here
+     * because this is the one place where the omission is destructive rather than merely
+     * permissive, and a reader deserves to know that rather than infer it from the absence
+     * of a check.
+     */
     private void handleReplicateRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
         short topicLength = buffer.getShort();
         byte[] topicBytes = new byte[topicLength];
