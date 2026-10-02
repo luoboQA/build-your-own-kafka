@@ -387,13 +387,46 @@ public class SimpleKafkaBroker {
                 metadataExecutor.shutdown();
                 metadataExecutor.awaitTermination(5, TimeUnit.SECONDS);
 
-                // Close ZooKeeper connection
-                zkClient.close();
+                // Close ZooKeeper connection. This has to be abandonable: close() submits a
+                // close request and waits for the reply, and a server that is unreachable
+                // never sends one. This runs on the shutdown hook, so waiting there means
+                // the process ignores SIGTERM for ever and has to be killed outright -
+                // which is what a broker whose ZooKeeper had gone looked like.
+                closeZooKeeperWithoutWaiting();
 
                 LOGGER.info("SimpleKafka broker stopped");
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Error stopping broker", e);
             }
+        }
+    }
+
+    /**
+     * Close the ZooKeeper client without letting it hold up the shutdown.
+     *
+     * <p>The close happens on a daemon thread, and the wait for it is bounded. Nothing
+     * downstream depends on the connection being closed cleanly - the session ending is
+     * what removes this broker's ephemeral nodes, and that happens whether or not the
+     * client managed to say goodbye - so a close that will not finish is simply left.
+     */
+    private void closeZooKeeperWithoutWaiting() {
+        Thread closer = new Thread(() -> {
+            try {
+                zkClient.close();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error closing the ZooKeeper client", e);
+            }
+        }, "zookeeper-close-" + brokerId);
+        closer.setDaemon(true);
+        closer.start();
+
+        try {
+            closer.join(2_000);
+            if (closer.isAlive()) {
+                LOGGER.warning("ZooKeeper did not close within 2s; stopping without waiting for it");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
